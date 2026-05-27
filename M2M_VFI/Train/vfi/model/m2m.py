@@ -7,6 +7,47 @@ import vfi.model.pwcnet as pwcnet
 import vfi.model.softsplat as softsplat
 
 
+def hermite_flow_scale(F_0to1, F_1to0, t):
+    """
+    Computes intermediate forward and backward flows using cubic Hermite interpolation.
+    
+    Args:
+        F_0to1: Flow from frame 0 to frame 1.
+        F_1to0: Flow from frame 1 to frame 0.
+        t: Time step (0 to 1).
+        
+    Returns:
+        F_t0: Flow from intermediate frame 0 to t (used for forward warping I0).
+        F_t1: Flow from intermediate frame 1 to t (used for forward warping I1).
+    """
+    dt = 1.0
+    
+    # Hermite basis for t
+    h01 = -2 * (t**3) + 3 * (t**2)
+    h10 = (t**3) - 2 * (t**2) + t
+    h11 = (t**3) - (t**2)
+    
+    tangent_0 = F_0to1
+    tangent_1 = -F_1to0
+    
+    # Forward intermediate flow (from 0 to t). pos_0 = 0, pos_1 = F_0to1
+    F_t0 = h10 * dt * tangent_0 + h01 * F_0to1 + h11 * dt * tangent_1
+    
+    # Hermite basis for (1-t) to compute flow from 1 to t
+    s = 1.0 - t
+    h01_s = -2 * (s**3) + 3 * (s**2)
+    h10_s = (s**3) - 2 * (s**2) + s
+    h11_s = (s**3) - (s**2)
+    
+    tangent_0_inv = F_1to0
+    tangent_1_inv = -F_0to1
+    
+    # Backward intermediate flow (from 1 to t). pos_0 = 0, pos_1 = F_1to0
+    F_t1 = h10_s * dt * tangent_0_inv + h01_s * F_1to0 + h11_s * dt * tangent_1_inv
+    
+    return F_t0, F_t1
+
+
 ##########################################################
 
 def forwarp_mframe_mask(tenIn1, tenFlow1, t1, tenIn2, tenFlow2, t2, tenMetric1=None, tenMetric2=None):
@@ -311,7 +352,7 @@ class M2M_PWC(torch.nn.Module):
         return self.tenParams
     #end
 
-    def forward(self, im0, im1, fltTimes=[0.5], ratio=None):
+    def forward(self, im0, im1, fltTimes=[0.5], ratio=None, motion_model='linear'):
         if ratio is None:
             ratio = self.ratio
         #end
@@ -376,11 +417,15 @@ class M2M_PWC(torch.nn.Module):
 
 
             t0 = fltTime
-            flow0 = tenFwd * t0 
-            metric0 = self.paramAlpha * tenPhotoone
-
             t1 = 1.0 - fltTime
-            flow1 = tenBwd * t1
+
+            if motion_model == 'hermite':
+                flow0, flow1 = hermite_flow_scale(tenFwd, tenBwd, fltTime)
+            else:
+                flow0 = tenFwd * t0 
+                flow1 = tenBwd * t1
+                
+            metric0 = self.paramAlpha * tenPhotoone
             metric1 = self.paramAlpha * tenPhototwo
 
             flow0 = flow0.reshape(N_, self.branch, 2, H_, W_).permute(1,0,2,3,4)

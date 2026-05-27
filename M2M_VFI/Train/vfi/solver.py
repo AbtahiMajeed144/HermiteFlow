@@ -22,13 +22,13 @@ class Solver:
         self.losses = loss
     #end
 
-    def update(self, im0, im1, gt, step=0, t_step=0, training=True, fltTimes=[0.5]):
+    def update(self, im0, im1, gt, step=0, t_step=0, training=True, fltTimes=[0.5], motion_model='linear'):
 
         if training:
             self.netNetwork.train()
             self.optimG.zero_grad()
 
-            pred = self.netNetwork(im0, im1, fltTimes)[0]
+            pred = self.netNetwork(im0, im1, fltTimes, motion_model=motion_model)[0]
 
             output ={'pred':pred}
 
@@ -49,7 +49,7 @@ class Solver:
         else:
             self.netNetwork.eval()
 
-            pred = self.netNetwork(im0, im1, fltTimes)[0]
+            pred = self.netNetwork(im0, im1, fltTimes, motion_model=motion_model)[0]
             #pdb.set_trace()
             output ={'pred':pred}
             

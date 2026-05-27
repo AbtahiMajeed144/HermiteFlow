@@ -21,7 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def train(cfg,local_rank):
+def train(cfg, local_rank, motion_model='linear'):
 
     ## setup environment
     run_id = random.randint(1, 100000)
@@ -88,7 +88,7 @@ def train(cfg,local_rank):
             gt = gt.to(device, non_blocking=True) / 255
 
             ###################################################
-            output = solver.update(img0, img1, gt, step, cfg["training"]["train_iters"], training=True, fltTimes=[t_loc])
+            output = solver.update(img0, img1, gt, step, cfg["training"]["train_iters"], training=True, fltTimes=[t_loc], motion_model=motion_model)
             train_time_interval = time.time() - time_stamp
 
             pred = output['pred']
@@ -124,7 +124,7 @@ def train(cfg,local_rank):
             if step%cfg['training']['val_interval']==1:
                 bestflag = False             
                 if local_rank==0:
-                    psnr_ = evaluate(solver, val_data, step, local_rank, writer_val)
+                    psnr_ = evaluate(solver, val_data, step, local_rank, writer_val, motion_model)
                     if psnr_ > val_psnr:
                         val_psnr = psnr_
                         bestflag = True
@@ -139,7 +139,7 @@ def train(cfg,local_rank):
     #end
 #end
 
-def evaluate(solver, val_data, step, local_rank, writer_val):
+def evaluate(solver, val_data, step, local_rank, writer_val, motion_model='linear'):
     loss_tt_list = []
     psnr_list = []
     time_stamp = time.time()
@@ -150,7 +150,7 @@ def evaluate(solver, val_data, step, local_rank, writer_val):
         gt = gt.to(device, non_blocking=True) / 255.
 
         with torch.no_grad():
-            output = solver.update(img0, img1, gt, training=False, fltTimes=[t_loc])
+            output = solver.update(img0, img1, gt, training=False, fltTimes=[t_loc], motion_model=motion_model)
         #end
 
         pred = output['pred']
@@ -199,6 +199,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument('--local_rank', type = int, default = 0)
+    parser.add_argument('--motion_model', type=str, default='linear', choices=['linear', 'hermite'], help="Motion model for flow scaling")
 
     args = parser.parse_args()
     with open(args.config) as fp:
@@ -206,4 +207,4 @@ if __name__ == "__main__":
 
     cfg['exp_name'] = args.config
 
-    train(cfg,local_rank = args.local_rank)
+    train(cfg, local_rank=args.local_rank, motion_model=args.motion_model)
