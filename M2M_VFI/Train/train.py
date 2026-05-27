@@ -21,7 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def train(cfg, local_rank, motion_model='linear'):
+def train(cfg, local_rank, motion_model='linear', pretrained=None):
 
     ## setup environment
     run_id = random.randint(1, 100000)
@@ -67,6 +67,12 @@ def train(cfg, local_rank, motion_model='linear'):
 
     #Setup Model
     model = get_model(cfg['model'])
+    
+    if pretrained and os.path.exists(pretrained):
+        if local_rank == 0:
+            print(f"Loading pretrained weights from {pretrained}")
+        state = torch.load(pretrained, map_location='cpu')
+        model.load_state_dict(state)
 
     #Setup optimizer
     optimizer = get_optimizer(cfg['training']['optimizer'],model)
@@ -199,7 +205,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument('--local_rank', type = int, default = 0)
-    parser.add_argument('--motion_model', type=str, default='linear', choices=['linear', 'hermite'], help="Motion model for flow scaling")
 
     args = parser.parse_args()
     with open(args.config) as fp:
@@ -207,4 +212,7 @@ if __name__ == "__main__":
 
     cfg['exp_name'] = args.config
 
-    train(cfg, local_rank=args.local_rank, motion_model=args.motion_model)
+    motion_model = cfg.get('model', {}).get('motion_model', 'linear')
+    pretrained = cfg.get('training', {}).get('resume', None)
+
+    train(cfg, local_rank=args.local_rank, motion_model=motion_model, pretrained=pretrained)
