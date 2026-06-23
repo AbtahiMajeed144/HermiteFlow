@@ -1,0 +1,43 @@
+trainer: stage_inr
+dataset:
+  type: vimeo_arb
+  path: ./data/vimeo90k/vimeo_septuplet
+  aug: true
+
+arch:
+  type: hermiteflow_r
+  ema: true
+  raft_iter: 20
+  num_coefficients: 4
+  coeff_net_channels: 64
+  coord_range: [-1., 1.]
+
+loss:
+  perceptual_loss: True
+  subsample:
+    type: random
+    ratio: 0.1
+
+optimizer:
+  type: adamw
+  init_lr: 0.00008
+  weight_decay: 0.00004
+  betas: [0.9, 0.999]
+  ft: true
+  warmup:
+    epoch: 1
+    multiplier: 1
+    buffer_epoch: 0
+    min_lr: 0.000008
+    mode: fix
+    start_from_zero: True
+  max_gn: null
+
+experiment:
+  amp: True
+  batch_size: 4
+  total_batch_size: 32
+  epochs: 60
+  save_ckpt_freq: 10
+  test_freq: 10
+  test_imlog_freq: 10

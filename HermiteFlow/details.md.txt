@@ -1,0 +1,52 @@
+[ Input Frames ]
+          I₀ , I₁  (3 × H × W)
+             │
+             ▼
+┌─────────────────────────────────────────┐
+│       1. THE HEAD: FEATURE EXTRACTOR    │  (e.g., Pre-trained RAFT)
+└────┬───────────────────────────────┬────┘
+     │                               │
+     │ Latent Features               │ Raw Optical Flows
+     ▼ A₀, A₁ (C × H/4 × W/4)         ▼ F₀➔₁, F₁➔₀ (2 × H × W)
+     │                               │
+     ├─────────────────┐             │
+     │                 ▼             │
+     │   ┌───────────────────────────┴┐
+     │   │ 2. THE BRAINS: COEFFICIENT │
+     │   │         PREDICTOR          │  (Shallow Convolutional Net)
+     │   └─────────────┬──────────────┘
+     │                 │
+     │                 ▼ Dense Spline Parameters
+     │                 α(x,y), β(x,y), γ(x,y), δ(x,y)  (4 × H × W)
+     │                 │
+     │                 └─────────────┐
+     │                               ▼
+     │                   ┌───────────────────────┐
+     │                   │  3. THE ENGINE:       │  ◀─── Target Time (t)
+     └───────────────────┤  PIXEL-SPACE HERMITE  │
+                         └───────────┬───────────┘
+                                     │
+                                     ▼ Bilateral Intermediate Flows
+                                     F_t➔₀, F_t➔₁  (2 × H × W)
+                                     │
+                                     ▼
+                         ┌───────────────────────┐
+                         │ 4. THE CANVAS:        │  ◀─── Pulls from I₀, I₁
+                         │ BACKWARD WARPING (ω)  │
+                         └───────────┬───────────┘
+                                     │
+                                     ▼ Warped Draft Frames
+                                     I_t➔₀, I_t➔₁  (3 × H × W)
+                                     │
+     ┌───────────────────────────────┘
+     ▼
+┌─────────────────────────────────────────┐
+│       5. THE TAIL: SYNTHESIS DECODER     │  (Lightweight CNN)
+└────────────────────┬────────────────────┘
+                     │
+                     ▼ Occlusion Mask & Blending
+                     M_t  (1 × H × W)
+                     │
+                     ▼
+              [ Interpolated Frame ]
+                 Î_t  (3 × H × W)
