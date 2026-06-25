@@ -96,6 +96,7 @@ if __name__ == "__main__":
         print(model)
         profiler.get_model_size(model)
         profiler.get_model_size(model, opt="trainable-only")
+        profiler.get_module_breakdown(model)
 
     # Checkpoint loading
     if not args.load_path == "":

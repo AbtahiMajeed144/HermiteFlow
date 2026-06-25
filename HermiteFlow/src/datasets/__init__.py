@@ -11,7 +11,7 @@
 import os
 import torch
 
-from .flow_dataset import fast_vimeo_flow
+from .flow_dataset import fast_vimeo_flow, vimeo_rgb_with_flow
 from .vimeo_arb import Vimeo_Arbitrary
 
 SMOKE_TEST = bool(os.environ.get("SMOKE_TEST", 0))
@@ -28,6 +28,13 @@ def create_dataset(config, is_eval=False, logger=None):
     elif config.dataset.type == "vimeo_arb":
         dataset_trn = Vimeo_Arbitrary("train", config.dataset.path, config.dataset.aug)
         dataset_val = Vimeo_Arbitrary("test", config.dataset.path, config.dataset.aug)
+    elif config.dataset.type == "vimeo_rgb_with_flow":
+        dataset_trn = vimeo_rgb_with_flow(
+            "train", config.dataset.path, config.dataset.expansion, config.dataset.aug
+        )
+        dataset_val = vimeo_rgb_with_flow(
+            "test", config.dataset.path, config.dataset.expansion, config.dataset.aug
+        )
     else:
         raise ValueError("%s not supported..." % config.dataset.type)
 

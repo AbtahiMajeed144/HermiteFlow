@@ -46,6 +46,8 @@ class HermiteFlow_R(nn.Module):
 
         # ============== Module 1: The Head (RAFT) ==============
         self.flow_estimator = initialize_RAFT()
+        for param in self.flow_estimator.parameters():
+            param.requires_grad = False
 
         # Feature projection layers (same as GIMM-VFI-R)
         cur_f_dims = [128, 96]   # RAFT feature dimensions
@@ -83,6 +85,8 @@ class HermiteFlow_R(nn.Module):
             nn.PReLU(6 * self.num_flows),
             nn.Conv2d(6 * self.num_flows, 3, 7, 1, 3),
         )
+
+        self._load_and_freeze_decoder(config)
 
     def _get_updateblock(self, cdim, scale_factor=None):
         return BasicUpdateBlock(
@@ -225,7 +229,7 @@ class HermiteFlow_R(nn.Module):
         other_pred = [img_warp_4]
         return imgt_pred, flowt0_pred, flowt1_pred, other_pred
 
-    def forward(self, img_xs, coord=None, t=None, iters=None, ds_factor=None):
+    def forward(self, img_xs, coord=None, t=None, iters=None, ds_factor=None, precomputed_flows=None):
         """
         Full forward pass through all 5 modules.
 
@@ -255,9 +259,17 @@ class HermiteFlow_R(nn.Module):
         iters = self.raft_iter if iters is None else iters
 
         # ===== Module 1: The Head =====
-        f01, f10, features0, features1, corr_fn = self.cal_bidirection_flow(
-            255 * img_xs[:, :, 0], 255 * img_xs[:, :, 1], iters=iters
-        )
+        if precomputed_flows is not None:
+            f01 = precomputed_flows[:, 0]
+            f10 = precomputed_flows[:, 1]
+            with torch.no_grad():
+                _, _, features0, features1, corr_fn = self.cal_bidirection_flow(
+                    255 * img_xs[:, :, 0], 255 * img_xs[:, :, 1], iters=iters
+                )
+        else:
+            f01, f10, features0, features1, corr_fn = self.cal_bidirection_flow(
+                255 * img_xs[:, :, 0], 255 * img_xs[:, :, 1], iters=iters
+            )
 
         # ===== Module 2: The Brains =====
         # Use the lower-resolution projected features for coefficient prediction
@@ -345,3 +357,31 @@ class HermiteFlow_R(nn.Module):
         corr = torch.cat([corr0, corr1], dim=1)
         flow = torch.cat([flow0, flow1], dim=1)
         return corr, flow
+
+    def _load_and_freeze_decoder(self, config):
+        if getattr(config, "pretrained_decoder_ckpt", None) is not None:
+            ckpt_path = config.pretrained_decoder_ckpt
+            print(f"Loading pretrained AMT decoder weights from: {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            state_dict = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
+
+            # Remove module. prefix if exists
+            cleaned_state_dict = {}
+            for k, v in state_dict.items():
+                new_k = k.replace("module.", "")
+                if "amt_" in new_k:
+                    cleaned_state_dict[new_k] = v
+
+            missing, unexpected = self.load_state_dict(cleaned_state_dict, strict=False)
+            print(f"AMT Decoder keys loaded: {len(cleaned_state_dict)} keys.")
+            if len(missing) > 0 and not all(not k.startswith("amt_") for k in missing):
+                print(f"Warning: some amt_ keys were missing: {[k for k in missing if k.startswith('amt_')]}")
+
+        # Always freeze amt_ modules
+        print("Freezing all AMT decoder modules...")
+        frozen_count = 0
+        for name, param in self.named_parameters():
+            if "amt_" in name:
+                param.requires_grad = False
+                frozen_count += 1
+        print(f"Frozen {frozen_count} AMT parameters.")

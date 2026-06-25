@@ -39,3 +39,39 @@ class Profiler:
                         opt,
                         sum(p.numel() for p in model.blocks.parameters()) / 1e6,
                     )
+
+    def get_module_breakdown(self, model):
+        self._logger.info("\n[MODULE BREAKDOWN]")
+        
+        # We want to iterate through top-level modules of the base model
+        # If wrapped in DDP, use module.module
+        base_model = model.module if hasattr(model, "module") else model
+        
+        total_trainable = 0
+        total_frozen = 0
+        
+        for name, child in base_model.named_children():
+            trainable = sum(p.numel() for p in child.parameters() if p.requires_grad)
+            frozen = sum(p.numel() for p in child.parameters() if not p.requires_grad)
+            
+            total_trainable += trainable
+            total_frozen += frozen
+            
+            total_mod = trainable + frozen
+            if total_mod > 0:
+                self._logger.info(
+                    "  %-25s %8.4fM (trainable: %8.4fM, frozen: %8.4fM)", 
+                    name + ":", 
+                    total_mod / 1e6, 
+                    trainable / 1e6, 
+                    frozen / 1e6
+                )
+                
+        total_all = total_trainable + total_frozen
+        self._logger.info(
+            "  %-25s %8.4fM (trainable: %8.4fM, frozen: %8.4fM)\n", 
+            "TOTAL:", 
+            total_all / 1e6, 
+            total_trainable / 1e6, 
+            total_frozen / 1e6
+        )

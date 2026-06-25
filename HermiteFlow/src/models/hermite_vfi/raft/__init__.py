@@ -4,7 +4,7 @@ import torch
 from .extractor import BasicEncoder
 
 
-def initialize_RAFT(model_path="pretrained_ckpt/raft-things.pth", device="cuda"):
+def initialize_RAFT(model_path="pretrained/raft-things.pth", device="cuda"):
     """Initializes the RAFT model."""
     args = argparse.ArgumentParser()
     args.raft_model = model_path

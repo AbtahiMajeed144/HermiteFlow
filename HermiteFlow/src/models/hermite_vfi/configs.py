@@ -18,6 +18,7 @@ class HermiteFlowConfig:
     num_coefficients: int = 4       # α, β, γ, δ  Hermite basis modulation
     coeff_net_channels: int = 64    # Width of coefficient predictor CNN
     coord_range: List[float] = MISSING
+    pretrained_decoder_ckpt: Optional[str] = None
 
     @classmethod
     def create(cls, config):

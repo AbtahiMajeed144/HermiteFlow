@@ -11,28 +11,29 @@ def create_hermiteflow_optimizer(model, config):
     if not config.ft:
         param_dicts = model.parameters()
     else:
-        # Fine-tuning mode: higher LR for AMT decoder layers,
-        # lower LR for pretrained backbone and Hermite modules
+        # Fine-tuning mode: we freeze the AMT decoder and train the rest.
+        # Just in case some AMT parameters are left unfrozen, we put them in a lower LR group.
+        # The main parameters to train (CoefficientNet) get the primary LR.
         param_dicts = [
             {
                 "params": [
                     p
                     for n, p in model.named_parameters()
                     if "amt_" in n and p.requires_grad
-                ]
+                ],
+                "lr": config.init_lr * 0.01,
+                "weight_decay": config.weight_decay * 0.01,
             },
             {
                 "params": [
                     p
                     for n, p in model.named_parameters()
                     if "amt_" not in n and p.requires_grad
-                ],
-                "lr": config.init_lr * 0.01,
-                "weight_decay": config.weight_decay * 0.01,
+                ]
             },
         ]
-        if len(param_dicts[1]["params"]) == 0:
-            print("only amt_part will be trained")
+        if len(param_dicts[0]["params"]) == 0:
+            print("No amt_ parameters to train (frozen). Training other parts.")
 
     if optimizer_type == "adamw":
         optimizer = torch.optim.AdamW(

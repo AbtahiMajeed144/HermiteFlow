@@ -1,7 +1,8 @@
 trainer: stage_inr
 dataset:
-  type: vimeo_arb
-  path: ./data/vimeo90k/vimeo_septuplet
+  type: vimeo_rgb_with_flow
+  path: ./data/vimeo90k/vimeo_triplet
+  expansion: true
   aug: true
 
 arch:
@@ -11,6 +12,7 @@ arch:
   num_coefficients: 4
   coeff_net_channels: 64
   coord_range: [-1., 1.]
+  pretrained_decoder_ckpt: pretrained/gimmvfi_r_arb.pt
 
 loss:
   perceptual_loss: True

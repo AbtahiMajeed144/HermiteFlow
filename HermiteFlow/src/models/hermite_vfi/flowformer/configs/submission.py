@@ -14,7 +14,7 @@ _CN.add_noise = False
 _CN.critical_params = []
 
 _CN.transformer = "latentcostformer"
-_CN.model = "pretrained_ckpt/flowformer_sintel.pth"
+_CN.model = "pretrained/flowformer_sintel.pth"
 
 # latentcostformer
 _CN.latentcostformer = CN()
