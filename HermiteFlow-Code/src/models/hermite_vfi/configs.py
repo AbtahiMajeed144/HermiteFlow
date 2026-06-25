@@ -18,6 +18,8 @@ class HermiteFlowConfig:
     num_coefficients: int = 4       # α, β, γ, δ  Hermite basis modulation
     coeff_net_channels: int = 64    # Width of coefficient predictor CNN
     coord_range: List[float] = MISSING
+    pretrained_raft_ckpt: str = "pretrained/raft-things.pth"
+    pretrained_flowformer_ckpt: str = "pretrained/flowformer_sintel.pth"
     pretrained_decoder_ckpt: Optional[str] = None
 
     @classmethod

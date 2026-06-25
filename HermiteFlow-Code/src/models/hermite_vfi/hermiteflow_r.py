@@ -44,8 +44,11 @@ class HermiteFlow_R(nn.Module):
         self.config = config = config.copy()
         self.raft_iter = config.raft_iter
 
+        if getattr(config, "pretrained_decoder_ckpt", None) is None:
+            config.pretrained_decoder_ckpt = "pretrained/gimmvfi_r_arb_lpips.pt"
+
         # ============== Module 1: The Head (RAFT) ==============
-        self.flow_estimator = initialize_RAFT()
+        self.flow_estimator = initialize_RAFT(config.pretrained_raft_ckpt)
         for param in self.flow_estimator.parameters():
             param.requires_grad = False
 
@@ -229,7 +232,7 @@ class HermiteFlow_R(nn.Module):
         other_pred = [img_warp_4]
         return imgt_pred, flowt0_pred, flowt1_pred, other_pred
 
-    def forward(self, img_xs, coord=None, t=None, iters=None, ds_factor=None, precomputed_flows=None):
+    def forward(self, img_xs, coord=None, t=None, iters=None, ds_factor=None):
         """
         Full forward pass through all 5 modules.
 
@@ -259,14 +262,7 @@ class HermiteFlow_R(nn.Module):
         iters = self.raft_iter if iters is None else iters
 
         # ===== Module 1: The Head =====
-        if precomputed_flows is not None:
-            f01 = precomputed_flows[:, 0]
-            f10 = precomputed_flows[:, 1]
-            with torch.no_grad():
-                _, _, features0, features1, corr_fn = self.cal_bidirection_flow(
-                    255 * img_xs[:, :, 0], 255 * img_xs[:, :, 1], iters=iters
-                )
-        else:
+        with torch.no_grad():
             f01, f10, features0, features1, corr_fn = self.cal_bidirection_flow(
                 255 * img_xs[:, :, 0], 255 * img_xs[:, :, 1], iters=iters
             )
@@ -374,8 +370,10 @@ class HermiteFlow_R(nn.Module):
 
             missing, unexpected = self.load_state_dict(cleaned_state_dict, strict=False)
             print(f"AMT Decoder keys loaded: {len(cleaned_state_dict)} keys.")
-            if len(missing) > 0 and not all(not k.startswith("amt_") for k in missing):
-                print(f"Warning: some amt_ keys were missing: {[k for k in missing if k.startswith('amt_')]}")
+            
+            missing_amt_keys = [k for k in missing if k.startswith('amt_')]
+            if len(missing_amt_keys) > 0:
+                raise ValueError(f"Exact match failed for AMT decoder! Missing keys: {missing_amt_keys}")
 
         # Always freeze amt_ modules
         print("Freezing all AMT decoder modules...")

@@ -71,9 +71,6 @@ class Trainer(TrainerTemplate):
                 ]
             )
 
-            precomputed_flows = xs.get("precomputed_flows", None)
-            if precomputed_flows is not None:
-                precomputed_flows = precomputed_flows.to(self.device, non_blocking=True)
             xs = xs["xs"]
             xs = xs.to(self.device)  # [B, C, T, H, W]
 
@@ -90,7 +87,7 @@ class Trainer(TrainerTemplate):
                     None,
                 )
             ]
-            all_outputs = model(img_xs, coord_inputs, t=timesteps, precomputed_flows=precomputed_flows)
+            all_outputs = model(img_xs, coord_inputs, t=timesteps)
             targets = gt.detach()
 
             ######Loss Calculation######
@@ -154,9 +151,6 @@ class Trainer(TrainerTemplate):
                 .to(self.device, non_blocking=True)
                 .to(torch.float)
             )
-            precomputed_flows = xs.get("precomputed_flows", None)
-            if precomputed_flows is not None:
-                precomputed_flows = precomputed_flows.to(self.device, non_blocking=True)
             xs = xs["xs"]
 
             model.zero_grad(set_to_none=True)
@@ -177,7 +171,7 @@ class Trainer(TrainerTemplate):
                 )
             ]
 
-            all_outputs = model(img_xs, coord_inputs, t=timesteps_list, precomputed_flows=precomputed_flows)
+            all_outputs = model(img_xs, coord_inputs, t=timesteps_list)
 
             targets = [gt.detach()]
             mid_id = 0

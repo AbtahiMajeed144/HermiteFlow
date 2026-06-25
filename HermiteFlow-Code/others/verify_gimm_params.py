@@ -32,5 +32,5 @@ def analyze_gimm_checkpoint(ckpt_path):
     print(f"  {'TOTAL:':<25} {total_params/1e6:>8.4f}M\n")
 
 if __name__ == "__main__":
-    analyze_gimm_checkpoint("../pretrained/gimmvfi_r_arb.pt")
-    analyze_gimm_checkpoint("../pretrained/gimmvfi_f_arb.pt")
+    analyze_gimm_checkpoint("pretrained/gimmvfi_r_arb.pt")
+    analyze_gimm_checkpoint("pretrained/gimmvfi_f_arb.pt")

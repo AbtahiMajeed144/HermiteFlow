@@ -34,8 +34,16 @@ def verify_model(config_path):
     # 4. Print parameter breakdown
     profiler.get_module_breakdown(model)
 
-    # 5. Run dummy tensor pass with precomputed_flows
-    print(f"\nRunning dummy forward pass with precomputed flows...")
+    # Calculate trainable and non-trainable params
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+    print(f"\n[PARAMETER COUNT]")
+    print(f"Trainable params:     {trainable_params / 1e6:.4f}M")
+    print(f"Non-trainable params: {non_trainable_params / 1e6:.4f}M")
+    print(f"Total params:         {(trainable_params + non_trainable_params) / 1e6:.4f}M")
+
+    # 5. Run dummy tensor pass
+    print(f"\nRunning dummy forward pass...")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     model.eval()
@@ -46,18 +54,14 @@ def verify_model(config_path):
     t = [torch.full((B,), 0.5, device=device)]
     coord_inputs = [(torch.zeros(B, 1, H, W, 3, device=device), None)]
     
-    # Precomputed flows (B, 2, 2, H, W) -> [f01, f10]
-    precomputed_flows = torch.rand(B, 2, 2, H, W, device=device)
-    
     with torch.no_grad():
         try:
             outputs = model(
                 img_xs, 
                 coord=coord_inputs, 
-                t=t, 
-                precomputed_flows=precomputed_flows
+                t=t
             )
-            print("Successfully executed forward pass with precomputed flows!")
+            print("Successfully executed forward pass!")
             print(f"Output imgt_pred shape: {outputs['imgt_pred'][0].shape}")
         except Exception as e:
             print(f"Failed forward pass: {e}")

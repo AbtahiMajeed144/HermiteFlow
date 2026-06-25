@@ -173,19 +173,7 @@ class vimeo_rgb_with_flow(Dataset):
         return len(self.meta_data)
 
     def getimg(self, index):
-        flowpath = os.path.join(self.flow_root, self.meta_data[index])
         imgpath = os.path.join(self.image_root, self.meta_data[index])
-
-        flows = [
-            readFlow(flowpath + "/im1_im3.flo"),
-            (
-                (
-                    readFlow(flowpath + "/im2_im3.flo")
-                    - readFlow(flowpath + "/im2_im1.flo")
-                )
-            ),
-            -readFlow(flowpath + "/im3_im1.flo"),
-        ]
         
         imgs = [
             np.array(Image.open(imgpath + "/im1.png").convert("RGB")),
@@ -197,53 +185,26 @@ class vimeo_rgb_with_flow(Dataset):
         if "train" in self.dataset_name and self.if_aug:
             if random.uniform(0, 1) < 0.5:
                 imgs[0], imgs[2] = imgs[2], imgs[0]
-                flows[0], flows[2] = flows[2], flows[0]
-                flows[1] = -flows[1]
                 t = 1 - t
                 
             ih, iw = self.h, self.w
             x = random.randint(0, iw - 256)
             y = random.randint(0, ih - 256)
-            for i in range(len(flows)):
-                flows[i] = flows[i][y : y + 256, x : x + 256, :]
             for i in range(len(imgs)):
                 imgs[i] = imgs[i][y : y + 256, x : x + 256, :]
 
-        return np.concatenate(flows, axis=-1), imgs, t
+        return imgs, t
 
     def __getitem__(self, index):
-        flows, imgs, t = self.getimg(index)
-
-        def normalize_flow(fs):
-            flow_scaler = torch.max(torch.abs(torch.cat((fs[:2], fs[4:]), 0)))
-            fs = fs / flow_scaler
-            fs = (fs + 1.0) / 2.0
-            return fs, flow_scaler
-
-        ori_flows = torch.from_numpy(flows.copy()).permute(2, 0, 1)
-        flows, flow_scaler = normalize_flow(ori_flows)
+        imgs, t = self.getimg(index)
 
         img0 = torch.from_numpy(imgs[0].copy()).permute(2, 0, 1) / 255.0
         gt = torch.from_numpy(imgs[1].copy()).permute(2, 0, 1) / 255.0
         img1 = torch.from_numpy(imgs[2].copy()).permute(2, 0, 1) / 255.0
 
-        precomputed_flows = torch.cat(
-            (
-                flows[:2].unsqueeze(1),
-                flows[2:4].unsqueeze(1),
-                flows[4:].unsqueeze(1),
-            ),
-            1,
-        ).to(torch.float)
-
         return {
             "xs": torch.cat(
                 (img0.unsqueeze(1), img1.unsqueeze(1), gt.unsqueeze(1)), 1
-            ).to(torch.float),
-            "precomputed_flows": precomputed_flows,
-            "flow_scaler": flow_scaler,
-            "ori_flows": torch.cat(
-                (ori_flows[:2].unsqueeze(1), -ori_flows[4:].unsqueeze(1)), 1
             ).to(torch.float),
             "t": (t * torch.ones(1)).to(torch.float),
         }
