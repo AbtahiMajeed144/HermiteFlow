@@ -16,7 +16,9 @@ from .septuplet_multi_t import VimeoSeptupletMultiT
 from .vimeo_arb import Vimeo_Arbitrary
 from .x4k_multi_t import X4KMultiT
 
-SMOKE_TEST = bool(os.environ.get("SMOKE_TEST", 0))
+from utils.env import env_flag
+
+SMOKE_TEST = env_flag("SMOKE_TEST")
 
 
 def create_dataset(config, is_eval=False, logger=None):
@@ -33,8 +35,10 @@ def create_dataset(config, is_eval=False, logger=None):
             clip_length=config.dataset.get("clip_length", 65),
             source=config.dataset.get("source", "auto"),
         )
+        repeat = config.dataset.get("repeat", 1)
         dataset_trn = X4KMultiT(
-            "train", config.dataset.path, aug=config.dataset.aug, **common
+            "train", config.dataset.path, aug=config.dataset.aug,
+            repeat=repeat, **common
         )
         val_path = config.dataset.get("val_path", None) or config.dataset.path
         dataset_val = X4KMultiT("test", val_path, aug=False, **common)

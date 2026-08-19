@@ -7,7 +7,9 @@ from torch.utils.data.dataloader import DataLoader
 from torch.cuda.amp import GradScaler
 
 logger = logging.getLogger(__name__)
-SMOKE_TEST = bool(os.environ.get("SMOKE_TEST", 0))
+from utils.env import env_flag
+
+SMOKE_TEST = env_flag("SMOKE_TEST")
 
 
 class TrainerTemplate:

@@ -60,6 +60,14 @@ class Trainer(TrainerTemplate):
         self.flow_distill_weight = float(
             getattr(self.config.loss, "flow_distill_weight", 0.0)
         )
+        # The teacher runs 2*K frozen flow passes per step, which at
+        # raft_iter=20 and K=5 costs more than the entire rest of the
+        # step (measured 901 ms vs 658 ms). RAFT's refinement converges
+        # quickly and this is a target, not the measurement Phase 1
+        # depends on, so it runs at a lower iteration count by default.
+        self.teacher_raft_iter = int(
+            getattr(self.config.loss, "teacher_raft_iter", 12)
+        )
 
     def get_accm(self):
         return AccmStageINR(
@@ -287,7 +295,10 @@ class Trainer(TrainerTemplate):
             teacher = None
             if self.flow_distill_weight > 0:
                 teacher = model_module.teacher_flows(
-                    img_xs[:, :, 0], img_xs[:, :, 1], gts
+                    img_xs[:, :, 0],
+                    img_xs[:, :, 1],
+                    gts,
+                    iters=self.teacher_raft_iter,
                 )
 
             with sync_context:

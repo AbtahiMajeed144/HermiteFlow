@@ -76,6 +76,7 @@ class X4KMultiT(Dataset):
         num_divisions=DEFAULT_DIVISIONS,
         clip_length=DEFAULT_CLIP_LENGTH,
         source="auto",
+        repeat=1,
     ):
         assert split in ("train", "test"), split
         assert source in ("auto", "mp4", "png"), source
@@ -95,6 +96,15 @@ class X4KMultiT(Dataset):
         self.clip_length = clip_length
         self.if_aug = aug and split == "train"
         self.crop_size = crop_size
+        # X-TRAIN has only ~4.4k clips, but each one yields many distinct
+        # samples: a random 32-frame window out of 65, a random crop, and
+        # random flips. One pass over the clip list is therefore a very
+        # small epoch - at batch 4 and total_batch 32 it is about 137
+        # optimizer steps, so a nominal 60 epochs would be ~8k updates,
+        # far too few to train three networks from scratch. `repeat`
+        # draws each clip this many times per epoch so that "epoch"
+        # remains a useful unit for checkpointing and LR scheduling.
+        self.repeat = max(1, int(repeat)) if split == "train" else 1
 
         self.source, self.clips = self._index(path, source)
         if not self.clips:
@@ -124,7 +134,7 @@ class X4KMultiT(Dataset):
         return "png", dirs
 
     def __len__(self):
-        return len(self.clips)
+        return len(self.clips) * self.repeat
 
     # ------------------------------------------------------------------
     # Timestep selection
@@ -288,6 +298,7 @@ class X4KMultiT(Dataset):
     def __getitem__(self, index):
         # A handful of clips can be shorter than the nominal 65 frames or
         # fail to decode; resample rather than crash a multi-hour run.
+        index %= len(self.clips)
         for attempt in range(8):
             clip = self.clips[index]
             plan = self._plan(self._clip_length(clip))

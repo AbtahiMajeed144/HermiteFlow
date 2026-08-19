@@ -42,6 +42,15 @@ dataset:
   num_timesteps: 5
   crop_size: 256
   aug: true
+  # X-TRAIN is only ~4.4k clips, but each yields many distinct samples
+  # (random 32-frame window out of 65, random crop, random flips). One
+  # pass over the clip list is ~137 optimizer steps at the settings
+  # below, so a nominal 60 epochs would be only ~8k updates. Drawing
+  # each clip 8x per epoch makes an epoch ~1.1k steps and 60 epochs
+  # ~66k, which is a sane budget for three networks trained from
+  # scratch. Raise `repeat` rather than `epochs` so checkpoint and
+  # eval cadence stay reasonable.
+  repeat: 8
 
 arch:
   type: hermiteflow_r
@@ -75,6 +84,11 @@ loss:
   # Trajectory distillation against the frozen estimator run on the
   # ground-truth middle frames. Costs 2*K extra flow passes per step.
   flow_distill_weight: 0.1
+  # The teacher runs 2*K frozen flow passes per step. At raft_iter=20
+  # and K=5 that measured 901 ms against 658 ms for the entire rest of
+  # the step; 12 iterations cuts it to 528 ms and the target is only
+  # needed well enough to break the time-to-location ambiguity.
+  teacher_raft_iter: 12
 
 optimizer:
   type: adamw
@@ -99,10 +113,13 @@ experiment:
   # cards, so batch_size=4 is 2 per card = 5.6 GiB at K=5. Under DDP
   # batch_size is per process, so 4 means 11.3 GiB per card - still fits,
   # but drop to 2 if you also raise crop_size or K.
-  batch_size: 4
+  batch_size: 8
   total_batch_size: 32
   num_workers: 4
   epochs: 60
-  save_ckpt_freq: 5
+  # Kaggle sessions are capped (9-12 h) and a full run will not finish
+  # in one. Checkpoint every epoch so a timeout costs at most one, and
+  # chain sessions with --resume --load-path <ckpt>.
+  save_ckpt_freq: 1
   test_freq: 5
   test_imlog_freq: 5

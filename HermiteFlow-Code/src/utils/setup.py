@@ -17,6 +17,7 @@ from pathlib import Path
 
 from omegaconf import OmegaConf
 
+from .env import env_flag
 from .writer import Writer
 from .config import config_setup
 from .dist import initialize as dist_init
@@ -28,7 +29,7 @@ def logger_setup(log_path, eval=False):
     for hdlr in logging.root.handlers:
         logging.root.removeHandler(hdlr)
 
-    SMOKE_TEST = bool(os.environ.get("SMOKE_TEST", 0))
+    SMOKE_TEST = env_flag("SMOKE_TEST")
 
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
