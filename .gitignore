@@ -1,3 +1,4 @@
 *.pth
+!alex.pth
 *.pt
 *.pyc
