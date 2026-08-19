@@ -26,11 +26,17 @@ class TrainerTemplate:
     ):
         super().__init__()
 
-        num_workers = 32
+        # Dataloader workers. The upstream value was a hard-coded 32, which
+        # oversubscribes any machine with a normal core count (a Kaggle
+        # session has 4) and deadlocks on Windows. Configurable, with a
+        # default that fits the host.
+        num_workers = config.experiment.get("num_workers", None)
+        if num_workers is None:
+            num_workers = min(8, (os.cpu_count() or 2))
+        num_workers = int(num_workers)
 
         if SMOKE_TEST:
-            if not torch.distributed.is_initialized():
-                num_workers = 0
+            num_workers = 0
             config.experiment.test_freq = 1
             config.experiment.save_ckpt_freq = 1
 

@@ -1,6 +1,11 @@
 # --------------------------------------------------------
-# HermiteFlow-VFI — Optimizer factory
+# HermiteFlow — optimizer factory
 # Adapted from GIMM-VFI's optimizer.py
+#
+# Everything that is trainable is trained: CoeffNet (Phase 2),
+# RefineNet (Phase 4) and SynthNet (Phase 5). The flow estimator
+# (Phase 1) is frozen and Phase 3 has no parameters at all, so
+# both are absent from the parameter list by construction.
 # --------------------------------------------------------
 
 import torch
@@ -8,63 +13,27 @@ import torch
 
 def create_hermiteflow_optimizer(model, config):
     optimizer_type = config.type.lower()
-    if not config.ft:
-        param_dicts = model.parameters()
-    else:
-        # Fine-tuning mode: we freeze the AMT decoder and train the rest.
-        # Just in case some AMT parameters are left unfrozen, we put them in a lower LR group.
-        # The main parameters to train (CoefficientNet) get the primary LR.
-        param_dicts = [
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if "amt_" in n and p.requires_grad
-                ],
-                "lr": config.init_lr * 0.01,
-                "weight_decay": config.weight_decay * 0.01,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if "amt_" not in n and p.requires_grad
-                ]
-            },
-        ]
-        if len(param_dicts[0]["params"]) == 0:
-            print("No amt_ parameters to train (frozen). Training other parts.")
+
+    params = [p for p in model.parameters() if p.requires_grad]
+    if len(params) == 0:
+        raise ValueError("no trainable parameters found")
+
+    kwargs = dict(lr=config.init_lr, weight_decay=config.weight_decay)
+    if optimizer_type in ("adamw", "adam"):
+        kwargs["betas"] = tuple(config.betas)
 
     if optimizer_type == "adamw":
-        optimizer = torch.optim.AdamW(
-            param_dicts,
-            lr=config.init_lr,
-            weight_decay=config.weight_decay,
-            betas=config.betas,
-        )
-    elif optimizer_type == "adam":
-        optimizer = torch.optim.Adam(
-            param_dicts,
-            lr=config.init_lr,
-            weight_decay=config.weight_decay,
-            betas=config.betas,
-        )
-    elif optimizer_type == "sgd":
-        optimizer = torch.optim.SGD(
-            param_dicts,
-            lr=config.init_lr,
-            weight_decay=config.weight_decay,
-            momentum=0.9,
-        )
-    else:
-        raise ValueError(f"{optimizer_type} invalid..")
-    return optimizer
+        return torch.optim.AdamW(params, **kwargs)
+    if optimizer_type == "adam":
+        return torch.optim.Adam(params, **kwargs)
+    if optimizer_type == "sgd":
+        return torch.optim.SGD(params, momentum=0.9, **kwargs)
+
+    raise ValueError(f"{optimizer_type} invalid..")
 
 
 def create_optimizer(model, config):
     arch_type = config.arch.type.lower()
     if "hermite" in arch_type:
-        optimizer = create_hermiteflow_optimizer(model, config.optimizer)
-    else:
-        raise ValueError(f"{arch_type} invalid..")
-    return optimizer
+        return create_hermiteflow_optimizer(model, config.optimizer)
+    raise ValueError(f"{arch_type} invalid..")

@@ -12,13 +12,55 @@ import os
 import torch
 
 from .flow_dataset import fast_vimeo_flow, vimeo_rgb_with_flow
+from .septuplet_multi_t import VimeoSeptupletMultiT
 from .vimeo_arb import Vimeo_Arbitrary
+from .x4k_multi_t import X4KMultiT
 
 SMOKE_TEST = bool(os.environ.get("SMOKE_TEST", 0))
 
 
 def create_dataset(config, is_eval=False, logger=None):
-    if config.dataset.type == "fast_vimeo_flow":
+    if config.dataset.type == "x4k_multi_t":
+        # X4K1000FPS. `path` is the training root (mp4 or png); `val_path`
+        # points at the already-decoded validation frames. Both are
+        # searched recursively, so the doubled directories in the Kaggle
+        # mirror (encoded_train/encoded_train/...) resolve either way.
+        common = dict(
+            num_timesteps=config.dataset.get("num_timesteps", 5),
+            crop_size=config.dataset.get("crop_size", 256),
+            frame_gap=config.dataset.get("frame_gap", 32),
+            num_divisions=config.dataset.get("num_divisions", 8),
+            clip_length=config.dataset.get("clip_length", 65),
+            source=config.dataset.get("source", "auto"),
+        )
+        dataset_trn = X4KMultiT(
+            "train", config.dataset.path, aug=config.dataset.aug, **common
+        )
+        val_path = config.dataset.get("val_path", None) or config.dataset.path
+        dataset_val = X4KMultiT("test", val_path, aug=False, **common)
+    elif config.dataset.type == "vimeo_septuplet_multi_t":
+        # HermiteFlow's default: K ground-truth middle frames per clip, so
+        # the curve fitted once in Phase 2 is supervised at several t.
+        num_timesteps = config.dataset.get("num_timesteps", 3)
+        crop_size = config.dataset.get("crop_size", 256)
+        span_mode = config.dataset.get("span_mode", "full")
+        dataset_trn = VimeoSeptupletMultiT(
+            "train",
+            config.dataset.path,
+            num_timesteps=num_timesteps,
+            aug=config.dataset.aug,
+            crop_size=crop_size,
+            span_mode=span_mode,
+        )
+        dataset_val = VimeoSeptupletMultiT(
+            "test",
+            config.dataset.path,
+            num_timesteps=num_timesteps,
+            aug=False,
+            crop_size=crop_size,
+            span_mode=span_mode,
+        )
+    elif config.dataset.type == "fast_vimeo_flow":
         dataset_trn = fast_vimeo_flow(
             "train", config.dataset.path, config.dataset.expansion, config.dataset.aug
         )

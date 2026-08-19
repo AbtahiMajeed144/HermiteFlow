@@ -12,24 +12,31 @@
 import torch
 import torch.nn.functional as F
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 backwarp_tenGrid = {}
 
 
 def warp(tenInput, tenFlow):
-    k = (str(tenFlow.device), str(tenFlow.size()))
+    # The identity grid is cached per (device, dtype, shape). It must be
+    # built on the *input's* device: the original keyed the cache by device
+    # but always allocated on a module-level global, so any run whose
+    # tensors were not on that global device raised a device mismatch.
+    k = (str(tenFlow.device), str(tenFlow.dtype), str(tenFlow.size()))
     if k not in backwarp_tenGrid:
         tenHorizontal = (
-            torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=device)
+            torch.linspace(
+                -1.0, 1.0, tenFlow.shape[3], device=tenFlow.device, dtype=tenFlow.dtype
+            )
             .view(1, 1, 1, tenFlow.shape[3])
             .expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
         )
         tenVertical = (
-            torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=device)
+            torch.linspace(
+                -1.0, 1.0, tenFlow.shape[2], device=tenFlow.device, dtype=tenFlow.dtype
+            )
             .view(1, 1, tenFlow.shape[2], 1)
             .expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
         )
-        backwarp_tenGrid[k] = torch.cat([tenHorizontal, tenVertical], 1).to(device)
+        backwarp_tenGrid[k] = torch.cat([tenHorizontal, tenVertical], 1)
 
     tenFlow = torch.cat(
         [

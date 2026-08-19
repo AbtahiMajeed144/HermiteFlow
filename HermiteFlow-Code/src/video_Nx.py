@@ -32,6 +32,18 @@ def default_parser():
     parser.add_argument("-p", "--postfix", type=str, default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument(
+        "--raft-ckpt",
+        type=str,
+        default=None,
+        help="RAFT weights; overrides arch.pretrained_raft_ckpt",
+    )
+    parser.add_argument(
+        "--flowformer-ckpt",
+        type=str,
+        default=None,
+        help="FlowFormer weights; overrides arch.pretrained_flowformer_ckpt",
+    )
     return parser
 
 
@@ -135,23 +147,11 @@ if __name__ == "__main__":
         model.zero_grad()
         ds_factor = args.ds_factor
         with torch.no_grad():
-            coord_inputs = [
-                (
-                    model.sample_coord_input(
-                        batch_size, s_shape,
-                        [1 / args.N * i],
-                        device=xs.device,
-                        upsample_ratio=ds_factor,
-                    ),
-                    None,
-                )
-                for i in range(1, args.N)
-            ]
             timesteps = [
                 i * 1 / args.N * torch.ones(xs.shape[0]).to(xs.device).to(torch.float)
                 for i in range(1, args.N)
             ]
-            all_outputs = model(xs, coord_inputs, t=timesteps, ds_factor=ds_factor)
+            all_outputs = model(xs, t=timesteps, ds_factor=ds_factor)
             out_frames = [padder.unpad(im) for im in all_outputs["imgt_pred"]]
 
         I1_pred_img = [

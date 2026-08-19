@@ -29,6 +29,21 @@ def default_parser():
     parser.add_argument("-l", "--load-path", type=str, default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument(
+        "--data-root", type=str, default="./data/SNU-FILM", help="SNU-FILM root"
+    )
+    parser.add_argument(
+        "--raft-ckpt",
+        type=str,
+        default=None,
+        help="RAFT weights; overrides arch.pretrained_raft_ckpt",
+    )
+    parser.add_argument(
+        "--flowformer-ckpt",
+        type=str,
+        default=None,
+        help="FlowFormer weights; overrides arch.pretrained_flowformer_ckpt",
+    )
     return parser
 
 
@@ -71,7 +86,7 @@ if __name__ == "__main__":
     model.eval()
 
     splits = ["medium", "hard", "extreme"]
-    root = "./data/SNU-FILM"
+    root = args.data_root
     for split in splits:
         if split == "medium":
             timestep = 4
@@ -108,34 +123,18 @@ if __name__ == "__main__":
             xs = torch.cat((I0.unsqueeze(2), I2.unsqueeze(2)), dim=2).to(
                 device, non_blocking=True
             )
-            batch_size = xs.shape[0]
-            s_shape = xs.shape[-2:]
-
-            # HermiteFlow: pass coord_inputs for API compat + timesteps
-            coord_inputs = [
-                (
-                    model.sample_coord_input(
-                        batch_size,
-                        s_shape,
-                        [(i + 1) * (1.0 / timestep)],
-                        device=xs.device,
-                    ),
-                    None,
-                )
+            # Phases 1-2 run once for the pair; phase 3 is evaluated at each
+            # requested t, so the whole sequence comes out of one call and
+            # every frame lies on the same fitted trajectory.
+            timesteps = [
+                (i + 1)
+                * (1.0 / timestep)
+                * torch.ones(xs.shape[0]).to(xs.device).to(torch.float)
                 for i in range(timestep - 1)
             ]
 
             with torch.no_grad():
-                all_outputs = model(
-                    xs,
-                    coord_inputs,
-                    t=[
-                        (i + 1)
-                        * (1.0 / timestep)
-                        * torch.ones(xs.shape[0]).to(xs.device).to(torch.float)
-                        for i in range(timestep - 1)
-                    ],
-                )
+                all_outputs = model(xs, t=timesteps)
                 all_outputs = [padder.unpad(im) for im in all_outputs["imgt_pred"]]
             for i in range(timestep - 1):
                 lpips_gt = 2 * gts[i].detach() - 1
@@ -155,7 +154,6 @@ if __name__ == "__main__":
                 )
             torch.cuda.empty_cache()
             del xs
-            del coord_inputs
 
             avg_psnr = np.mean(psnr_list)
             avg_lpips = np.mean(lpips_list)

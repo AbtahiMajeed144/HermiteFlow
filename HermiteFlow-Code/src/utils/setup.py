@@ -94,7 +94,13 @@ def setup(args, extra_args=()):
         OmegaConf.save(config, log_path.joinpath("config.yaml"))
 
         src_dir = Path(os.getcwd()).joinpath("src")
-        shutil.copytree(src_dir, log_path.joinpath("src"))
+        # Skip bytecode: it is worthless in a source snapshot and its deep
+        # paths trip the Windows MAX_PATH limit, which aborts the whole run.
+        shutil.copytree(
+            src_dir,
+            log_path.joinpath("src"),
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         logger.info(f"source copied to {log_path}/src")
     else:
         logger, writer, log_path = None, None, None

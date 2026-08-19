@@ -1,43 +1,92 @@
+# HermiteFlow with the FlowFormer backbone.
+#
+# Identical to hermiteflow_r.yaml apart from the Phase 1 estimator.
+# Override at launch with
+#   --data-path /path/to/vimeo_septuplet
+#   --flowformer-ckpt /path/to/flowformer_sintel.pth
+
 trainer: stage_inr
+
 dataset:
-  type: vimeo_rgb_with_flow
-  path: ./data/vimeo90k/vimeo_triplet
-  expansion: true
+  type: vimeo_septuplet_multi_t
+  path: ./data/vimeo90k/vimeo_septuplet
+  # K ground-truth middle frames supervised per clip. Phase 3 has two
+  # free residuals per pixel (d0, d1), and at a single t only the
+  # combination beta2*A + beta3*B is observable, so K must be >= 2 for
+  # them to separate at all. Maximum is 5 for 7-frame septuplets.
+  num_timesteps: 3
+  crop_size: 256
+  # "full" uses im1/im7 as endpoints, so t is drawn from {1/6..5/6} as
+  # the algorithm document specifies. "random" samples narrower spans
+  # too - wider t coverage, but off-protocol.
+  span_mode: full
   aug: true
 
 arch:
   type: hermiteflow_f
   ema: true
-  raft_iter: 20
-  num_coefficients: 4
+
+  # Phase 1
+  pretrained_flowformer_ckpt: pretrained/flowformer_sintel.pth
+  min_flow_scale: 1.0
+
+  # Phase 2 - endpoint velocities
   coeff_net_channels: 64
-  coord_range: [-1., 1.]
-  pretrained_decoder_ckpt: pretrained/gimmvfi_f_arb.pt
+  gate_init_bias: 5.0
+  gate_init_scale: 20.0
+  # Experiment (1): flow-only vs flow+RGB. The headline claim depends
+  # on this ablation, so run it first. Runtime switch - the branches
+  # are fused by addition, so one checkpoint serves both settings.
+  use_rgb_branch: true
+
+  # Phase 3 - trajectory degree
+  # Experiment (2): linear | quadratic | cubic | quartic
+  degree: cubic
+
+  # Phase 4
+  refine_net_channels: 64
+  refine_net_blocks: 3
+  splat_impl: torch
+  # Softmax-splat importance e^Z, Z = -|I0 - backwarp(I1,F)|_1, so
+  # photometrically convincing correspondences win collisions.
+  use_splat_importance: true
+
+  # Phase 5
+  synth_net_channels: 64
 
 loss:
   perceptual_loss: True
-  subsample:
-    type: random
-    ratio: 0.1
+  # Trajectory distillation against a privileged teacher (the frozen
+  # flow estimator run on the ground-truth middle frames). Photometric
+  # loss alone drives d0, d1 -> 0 through time-to-location ambiguity,
+  # so this term is what makes the curvature learnable at all.
+  # Costs 2*K extra frozen flow passes per step; set to 0.0 to disable.
+  flow_distill_weight: 0.1
 
 optimizer:
   type: adamw
-  init_lr: 0.00008
+  init_lr: 0.0002
   weight_decay: 0.00004
   betas: [0.9, 0.999]
-  ft: true
   warmup:
     epoch: 1
     multiplier: 1
     buffer_epoch: 0
-    min_lr: 0.000008
+    min_lr: 0.00002
     mode: fix
     start_from_zero: True
-  max_gn: null
+  max_gn: 1.0
 
 experiment:
+  # Mixed precision. The one numerically delicate operation - Phase 4's
+  # scatter and the division by its accumulated weight - is forced to
+  # fp32 inside forward_splat regardless of autocast, and this setting
+  # was smoke-tested for stability. Set to False if a run ever produces
+  # non-finite losses.
   amp: True
   batch_size: 4
+  # Kaggle sessions have 4 CPUs; raise on a bigger host.
+  num_workers: 4
   total_batch_size: 32
   epochs: 60
   save_ckpt_freq: 10

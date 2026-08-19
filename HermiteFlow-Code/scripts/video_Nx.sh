@@ -1,8 +1,18 @@
+#!/usr/bin/env bash
+# Nx video interpolation.
+#   ./scripts/video_Nx.sh <checkpoint> <input-frames> <output-dir> [N] [ds-factor]
+set -euo pipefail
+CKPT=${1:?usage: video_Nx.sh <checkpoint> <input-frames> <output-dir> [N] [ds-factor]}
+SOURCE=${2:?missing input frame directory}
+OUTPUT=${3:?missing output directory}
+N=${4:-8}
+DS=${5:-1.0}
+
 python src/video_Nx.py \
   -m configs/hermiteflow/hermiteflow_r.yaml \
-  -l path/to/checkpoint.ckpt \
+  -l "${CKPT}" \
   --eval \
-  --source-path path/to/input_frames \
-  --output-path path/to/output_dir \
-  --N 8 \
-  --ds-factor 1.0
+  --source-path "${SOURCE}" \
+  --output-path "${OUTPUT}" \
+  --N "${N}" \
+  --ds-factor "${DS}"

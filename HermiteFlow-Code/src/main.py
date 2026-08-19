@@ -5,7 +5,12 @@
 
 import ctypes
 
-libgcc_s = ctypes.CDLL("libgcc_s.so.1")
+try:
+    # Inherited from GIMM-VFI: preloading libgcc works around a glibc
+    # threading issue on some Linux images. Absent on Windows/macOS.
+    libgcc_s = ctypes.CDLL("libgcc_s.so.1")
+except OSError:
+    libgcc_s = None
 
 import argparse
 import math
@@ -38,6 +43,43 @@ def default_parser():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--resume", action="store_true")
+
+    # Paths that are environment-specific and therefore overridable from
+    # the command line. Each one wins over the value in the YAML config.
+    # Equivalent dotlist overrides (e.g. `dataset.path=/data/...`) also
+    # work and can be passed as trailing arguments.
+    parser.add_argument(
+        "--data-path",
+        type=str,
+        default=None,
+        help="dataset root; overrides dataset.path",
+    )
+    parser.add_argument(
+        "--val-path",
+        type=str,
+        default=None,
+        help="validation data root; overrides dataset.val_path "
+        "(X4K keeps train and val in separate trees)",
+    )
+    parser.add_argument(
+        "--num-timesteps",
+        type=int,
+        default=None,
+        help="ground-truth middle frames supervised per clip; "
+        "overrides dataset.num_timesteps",
+    )
+    parser.add_argument(
+        "--raft-ckpt",
+        type=str,
+        default=None,
+        help="RAFT weights; overrides arch.pretrained_raft_ckpt",
+    )
+    parser.add_argument(
+        "--flowformer-ckpt",
+        type=str,
+        default=None,
+        help="FlowFormer weights; overrides arch.pretrained_flowformer_ckpt",
+    )
     return parser
 
 
@@ -179,7 +221,8 @@ if __name__ == "__main__":
     else:
         trainer.run_epoch(optimizer, scheduler, epoch_st)
 
-    dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
 
     if distenv.master:
         writer.close()

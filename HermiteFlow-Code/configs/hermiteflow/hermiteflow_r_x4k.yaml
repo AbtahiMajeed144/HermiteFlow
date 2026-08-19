@@ -1,0 +1,108 @@
+# HermiteFlow on X4K1000FPS, RAFT backbone.
+#
+# This is the dataset the model is actually for. Vimeo motion is
+# near-linear, so F alone explains it and the curvature heads have
+# nothing to learn; X4K is captured at 1000 fps, so a 32-frame window
+# contains genuinely non-linear motion.
+#
+# Kaggle launch (train reads mp4 directly - decoding X-TRAIN to PNG
+# would cost ~240 GB and does not fit):
+#
+#   python src/main.py -m configs/hermiteflow/hermiteflow_r_x4k.yaml \
+#       --result-path /kaggle/working/runs \
+#       --data-path /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/encoded_train \
+#       --val-path  /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/val \
+#       --raft-ckpt /kaggle/input/<weights>/raft-things.pth
+
+trainer: stage_inr
+
+dataset:
+  type: x4k_multi_t
+  # Training clips. Points at the mp4 tree; both this and the doubled
+  # `encoded_train/encoded_train` resolve, the search is recursive.
+  path: ./data/x4k/encoded_train
+  # Validation frames, already decoded as PNG in the Kaggle mirror.
+  val_path: ./data/x4k/val
+  # "auto" picks mp4 when any are present, else png.
+  source: auto
+
+  # Temporal protocol, matching X-TEST as implemented in src/X4K.py:
+  # endpoints 32 frames apart, middles on the t = k/8 grid.
+  frame_gap: 32
+  num_divisions: 8
+  clip_length: 65
+
+  # K supervised middle frames. Decoding cost is set by the last frame
+  # needed, not by how many are kept, so raising K costs no extra I/O -
+  # only the per-t compute of phases 3-5. Conditioning of the (A, B)
+  # recovery on this grid, anchored at both extremes:
+  #   K=2 31.5x   K=3 31.3x   K=5 26.5x   K=7 18.6x
+  # 7 is the best-conditioned setting the dataset offers; drop to 5 or 3
+  # if memory is tight, and lower experiment.batch_size with it.
+  num_timesteps: 5
+  crop_size: 256
+  aug: true
+
+arch:
+  type: hermiteflow_r
+  ema: true
+
+  # Phase 1
+  pretrained_raft_ckpt: pretrained/raft-things.pth
+  raft_iter: 20
+  min_flow_scale: 1.0
+
+  # Phase 2 - endpoint velocities
+  coeff_net_channels: 64
+  gate_init_bias: 5.0
+  gate_init_scale: 20.0
+  use_rgb_branch: true
+
+  # Phase 3 - trajectory degree: linear | quadratic | cubic | quartic
+  degree: cubic
+
+  # Phase 4
+  refine_net_channels: 64
+  refine_net_blocks: 3
+  splat_impl: torch
+  use_splat_importance: true
+
+  # Phase 5
+  synth_net_channels: 64
+
+loss:
+  perceptual_loss: True
+  # Trajectory distillation against the frozen estimator run on the
+  # ground-truth middle frames. Costs 2*K extra flow passes per step.
+  flow_distill_weight: 0.1
+
+optimizer:
+  type: adamw
+  init_lr: 0.0002
+  weight_decay: 0.00004
+  betas: [0.9, 0.999]
+  warmup:
+    epoch: 1
+    multiplier: 1
+    buffer_epoch: 0
+    min_lr: 0.00002
+    mode: fix
+    start_from_zero: True
+  max_gn: 1.0
+
+experiment:
+  amp: True
+  # Per-sample cost grows with num_timesteps, since phases 3-5 run K
+  # times. Measured peak, 256x256 crop, batch 1, fp32:
+  #   K=3  2.01 GiB     K=5  2.82 GiB     K=7  3.64 GiB
+  # A T4 has ~15 GiB. Under DataParallel the batch is split across both
+  # cards, so batch_size=4 is 2 per card = 5.6 GiB at K=5. Under DDP
+  # batch_size is per process, so 4 means 11.3 GiB per card - still fits,
+  # but drop to 2 if you also raise crop_size or K.
+  batch_size: 4
+  total_batch_size: 32
+  num_workers: 4
+  epochs: 60
+  save_ckpt_freq: 5
+  test_freq: 5
+  test_imlog_freq: 5

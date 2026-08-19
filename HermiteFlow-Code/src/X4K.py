@@ -27,6 +27,21 @@ def default_parser():
     parser.add_argument("-l", "--load-path", type=str, default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval", action="store_true")
+    parser.add_argument(
+        "--data-root", type=str, default="./data/x4k/test", help="X4K test root"
+    )
+    parser.add_argument(
+        "--raft-ckpt",
+        type=str,
+        default=None,
+        help="RAFT weights; overrides arch.pretrained_raft_ckpt",
+    )
+    parser.add_argument(
+        "--flowformer-ckpt",
+        type=str,
+        default=None,
+        help="FlowFormer weights; overrides arch.pretrained_flowformer_ckpt",
+    )
     return parser
 
 
@@ -78,8 +93,7 @@ if __name__ == "__main__":
         raise ValueError("--load-path must be specified in evaluation mode")
     model.eval()
 
-    path = "./data/x4k/test"
-    listFiles = getXVFI(path)
+    listFiles = getXVFI(args.data_root)
 
     for strMode in ["XTEST-2k", "XTEST-4k"]:
         psnr_list, lpips_list = [], []
@@ -134,27 +148,12 @@ if __name__ == "__main__":
                 device, non_blocking=True
             )
 
-            batch_size = xs.shape[0]
-            s_shape = xs.shape[-2:]
             assert d[-1] <= 1
-            
-            # HermiteFlow coord API compat
-            coord_inputs = [
-                (
-                    model.sample_coord_input(
-                        batch_size,
-                        s_shape,
-                        [d[-1]],
-                        device=xs.device,
-                        upsample_ratio=ds_factor,
-                    ),
-                    None,
-                )
-            ]
+
             timesteps = [d[-1] * torch.ones(xs.shape[0]).to(xs.device).to(torch.float)]
 
             with torch.no_grad():
-                all_outputs = model(xs, coord_inputs, t=timesteps, ds_factor=ds_factor)
+                all_outputs = model(xs, t=timesteps, ds_factor=ds_factor)
                 I1_pred = all_outputs["imgt_pred"][0]  # 1,c,h,
                 I1_pred = padder.unpad(I1_pred)
                 I1_pred = (

@@ -54,6 +54,3 @@ class ExponentialMovingAverage(torch.nn.Module):
 
     def get_recon_imgs(self, *args, **kwargs):
         return self.module.get_recon_imgs(*args, **kwargs)
-
-    def sample_coord_input(self, *args, **kwargs):
-        return self.module.sample_coord_input(*args, **kwargs)

@@ -1,12 +1,11 @@
 # --------------------------------------------------------
-# HermiteFlow-VFI
-# Config dataclasses for HermiteFlow model variants.
+# HermiteFlow — architecture configuration
 # --------------------------------------------------------
 
-from typing import List, Optional
+from typing import Optional
 from dataclasses import dataclass
 
-from omegaconf import OmegaConf, MISSING
+from omegaconf import OmegaConf
 
 
 @dataclass
@@ -14,13 +13,59 @@ class HermiteFlowConfig:
     type: str = "hermiteflow_r"
     ema: Optional[bool] = None
     ema_value: Optional[float] = None
-    raft_iter: int = 20
-    num_coefficients: int = 4       # α, β, γ, δ  Hermite basis modulation
-    coeff_net_channels: int = 64    # Width of coefficient predictor CNN
-    coord_range: List[float] = MISSING
+
+    # ---- Phase 1: measure ----
+    # Frozen flow estimator. Both paths can be overridden from the
+    # command line (--raft-ckpt / --flowformer-ckpt) or with a dotlist
+    # override (arch.pretrained_raft_ckpt=...).
     pretrained_raft_ckpt: str = "pretrained/raft-things.pth"
     pretrained_flowformer_ckpt: str = "pretrained/flowformer_sintel.pth"
-    pretrained_decoder_ckpt: Optional[str] = None
+    raft_iter: int = 20
+    # Floor on the per-sample motion scale s = max(|F|, |F'|), in pixels.
+    # Everything in pixel units is normalised by s before entering a CNN.
+    min_flow_scale: float = 1.0
+
+    # ---- Phase 2: endpoint velocities ----
+    coeff_net_channels: int = 64
+    # Occlusion gate alpha = sigmoid(w1 - w2 * U/s), initial values.
+    # w1 = 5.0 and w2 = 20.0 put the half-way point at U/s = 0.25,
+    # i.e. a forward-backward error of a quarter of the clip's peak
+    # motion, and start the gate wide open for consistent flow.
+    gate_init_bias: float = 5.0
+    gate_init_scale: float = 20.0
+    # Experiment (1): the CoeffNet input ablation the headline claim
+    # rests on. False keeps the flow branch (F, backwarp(F',F), U) and
+    # drops the RGB branch (I0, backwarp(I1,F)). The branches are fused
+    # by addition, so this is a pure runtime switch - the same
+    # checkpoint runs either way and the flow branch needs no retraining.
+    use_rgb_branch: bool = True
+
+    # ---- Phase 3: trajectory degree ----
+    # Experiment (2): "linear" (d_i = 0, RIFE-style) | "quadratic"
+    # (B = 0, IQ-VFI) | "cubic" (ours) | "quartic" (adds C*beta4, the
+    # ablation upper end). CoeffNet always builds enough heads for the
+    # widest degree, so one checkpoint serves the whole ablation.
+    degree: str = "cubic"
+
+    # ---- Phase 4: reverse ----
+    refine_net_channels: int = 64
+    refine_net_blocks: int = 3
+    # Splat with softmax importance e^Z, Z = -|I0 - backwarp(I1,F)|_1,
+    # so photometrically convincing correspondences win collisions and
+    # foreground lands in front of background. False falls back to plain
+    # average splatting.
+    use_splat_importance: bool = True
+    # "torch" is the portable scatter implementation: it runs on CPU and
+    # CUDA, needs no extra dependency, and is the one covered by
+    # others/verify_hermiteflow.py. "cupy" uses the CUDA
+    # softmax-splatting kernel and is faster; "auto" picks it whenever
+    # cupy imports. Run the verification script on the target machine
+    # first - it compares the two backends whenever cupy is present -
+    # then switch this to "auto" for the speedup.
+    splat_impl: str = "torch"
+
+    # ---- Phase 5: synthesize ----
+    synth_net_channels: int = 64
 
     @classmethod
     def create(cls, config):

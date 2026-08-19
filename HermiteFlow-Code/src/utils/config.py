@@ -97,6 +97,36 @@ def augment_dist_defaults(config, distenv):
     return config
 
 
+# Command-line flags that override a config field wherever the config came
+# from (fresh YAML, a resumed run, or a saved eval config). Paths are the
+# only things that genuinely differ between machines, so they get first-class
+# flags; anything else can still be set with a trailing dotlist argument.
+CLI_OVERRIDES = {
+    "data_path": "dataset.path",
+    "val_path": "dataset.val_path",
+    "num_timesteps": "dataset.num_timesteps",
+    "raft_ckpt": "arch.pretrained_raft_ckpt",
+    "flowformer_ckpt": "arch.pretrained_flowformer_ckpt",
+}
+
+
+def cli_override_dotlist(args):
+    """Turn the path-style CLI flags into an OmegaConf dotlist."""
+    dotlist = []
+    for arg_name, config_key in CLI_OVERRIDES.items():
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            dotlist.append(f"{config_key}={value}")
+    return dotlist
+
+
+def apply_cli_overrides(config, args):
+    overrides = cli_override_dotlist(args)
+    if not overrides:
+        return config
+    return OmegaConf.merge(config, OmegaConf.from_dotlist(overrides))
+
+
 def config_setup(args, distenv, config_path, extra_args=()):
     if not osp.isfile(config_path):
         config_path = args.model_config
@@ -107,18 +137,22 @@ def config_setup(args, distenv, config_path, extra_args=()):
             config.experiment.batch_size = args.test_batch_size
         if not hasattr(config, "seed"):
             config.seed = args.seed
+        config = apply_cli_overrides(config, args)
 
     elif args.resume:
         config = load_config(config_path)
         if distenv.world_size != config.runtime.distenv.world_size:
             raise ValueError("world_size not identical to the resuming config")
+        config = apply_cli_overrides(config, args)
         config.runtime = {"args": vars(args), "distenv": distenv}
 
     else:  # training
         config_path = args.model_config
         config = load_config(config_path)
 
-        extra_config = OmegaConf.from_dotlist(extra_args)
+        extra_config = OmegaConf.from_dotlist(
+            list(extra_args) + cli_override_dotlist(args)
+        )
         config = OmegaConf.merge(config, extra_config)
 
         config = augment_defaults(config)
