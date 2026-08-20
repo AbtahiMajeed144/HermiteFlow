@@ -96,6 +96,15 @@ def _smooth(coeffs, factor):
     return back.reshape(shape)
 
 
+def fit_coeffs(residuals, times, powers, train_idx, smooth=1):
+    """Least-squares coefficients on `train_idx`, optionally smoothed."""
+    design = basis_matrix([times[k] for k in train_idx], powers)
+    pinv = torch.linalg.pinv(design).to(residuals[0].device)
+    stack = torch.stack([residuals[k] for k in train_idx])
+    coeffs = torch.einsum("pk,k...->p...", pinv.to(stack.dtype), stack)
+    return _smooth(coeffs, smooth)
+
+
 def fit_and_eval(residuals, times, powers, train_idx, eval_idx, smooth=1):
     """
     Least-squares fit of the basis coefficients on `train_idx`, evaluated
@@ -196,6 +205,36 @@ def main():
         g = out - lin_out if has_out else float("nan")
         gap = ins - out if has_out else float("nan")
         print(f"{d:<12}{ins:>14.3f}{out:>13.3f}{g:>15.3f}{gap:>8.2f}")
+
+    # ---- how large are the coefficients the oracle actually wants? ----
+    # The model can only close the gap by producing residuals of a
+    # comparable magnitude, so this says how far d0 and d1 still have
+    # to travel from their zero initialisation.
+    a_sum = b_sum = d0_sum = d1_sum = 0.0
+    n_fits = 0
+    for c in cached:
+        idx = list(range(len(c["times"])))
+        coeffs = fit_coeffs(c["residuals"], c["times"], DEGREE_BASIS["cubic"], idx)
+        A, B = coeffs[0], coeffs[1]
+        # invert the basis conversion: d0 = -A - B, d1 = A + 2B
+        a_sum += A.abs().mean().item()
+        b_sum += B.abs().mean().item()
+        d0_sum += (-A - B).abs().mean().item()
+        d1_sum += (A + 2 * B).abs().mean().item()
+        n_fits += 1
+    if n_fits:
+        scale_px = args.__dict__.get("_scale_px", None)
+        print("")
+        print("COEFFICIENT MAGNITUDE THE ORACLE WANTS  (units of s)")
+        print("")
+        print(f"  |A| {a_sum / n_fits:.4f}   |B| {b_sum / n_fits:.4f}")
+        print(f"  implied |d0| {d0_sum / n_fits:.4f} s   "
+              f"|d1| {d1_sum / n_fits:.4f} s")
+        print("")
+        print("  Multiply by the clip's motion scale s to get pixels. Compare")
+        print("  against the |d0| your checkpoint reports: that ratio is how")
+        print("  far the residuals still have to grow, and it sets how many")
+        print("  more steps the run needs.")
 
     # ---- how much of the headroom survives spatial smoothing? ----
     print("")
