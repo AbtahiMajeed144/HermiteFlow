@@ -83,7 +83,20 @@ def basis_matrix(times, powers):
     )
 
 
-def fit_and_eval(residuals, times, powers, train_idx, eval_idx):
+def _smooth(coeffs, factor):
+    """Average-pool the coefficient field and upsample back."""
+    if factor <= 1:
+        return coeffs
+    import torch.nn.functional as F
+    shape = coeffs.shape
+    flat = coeffs.reshape(-1, 1, shape[-2], shape[-1])
+    pooled = F.avg_pool2d(flat, factor, ceil_mode=True)
+    back = F.interpolate(pooled, size=shape[-2:], mode="bilinear",
+                         align_corners=False)
+    return back.reshape(shape)
+
+
+def fit_and_eval(residuals, times, powers, train_idx, eval_idx, smooth=1):
     """
     Least-squares fit of the basis coefficients on `train_idx`, evaluated
     on `eval_idx`. Returns summed squared error over the eval set.
@@ -100,6 +113,11 @@ def fit_and_eval(residuals, times, powers, train_idx, eval_idx):
     pinv = torch.linalg.pinv(design).to(residuals[0].device)      # (P, K')
     stack = torch.stack([residuals[k] for k in train_idx])        # (K', C,H,W)
     coeffs = torch.einsum("pk,k...->p...", pinv.to(stack.dtype), stack)
+    # A per-pixel oracle is unreachable by any feedforward network: it
+    # sees the answer, and its solution may be high-frequency noise.
+    # Low-passing the coefficient field approximates what a CNN can
+    # actually represent, so it is a far more honest ceiling.
+    coeffs = _smooth(coeffs, smooth)
 
     err, n = 0.0, 0
     for k in eval_idx:
@@ -132,6 +150,7 @@ def main():
 
     degrees = list(DEGREE_BASIS)
     acc = {d: {"ins": 0.0, "ins_n": 0, "out": 0.0, "out_n": 0} for d in degrees}
+    cached = []
 
     for i in range(args.num_samples):
         item = ds[i % len(ds)]
@@ -144,6 +163,8 @@ def main():
         s = flow_scale(f01, flow(img1, img0))
         # Residual the LINEAR model leaves at each t, in units of s.
         residuals = [(flow(img0, g) - t * f01) / s for t, g in zip(times, gts)]
+
+        cached.append({"residuals": residuals, "times": times})
 
         idx = list(range(len(times)))
         for d in degrees:
@@ -175,6 +196,44 @@ def main():
         g = out - lin_out if has_out else float("nan")
         gap = ins - out if has_out else float("nan")
         print(f"{d:<12}{ins:>14.3f}{out:>13.3f}{g:>15.3f}{gap:>8.2f}")
+
+    # ---- how much of the headroom survives spatial smoothing? ----
+    print("")
+    print("CUBIC ORACLE vs COEFFICIENT SMOOTHNESS  (hold-out)")
+    print("")
+    print("A per-pixel oracle is unreachable by a CNN: it sees the answer,")
+    print("and its solution may be high-frequency noise. Pooling the fitted")
+    print("(A, B) field before evaluating shows how much of the headroom")
+    print("survives at a resolution a network could plausibly predict.")
+    print("")
+    print(f"{'pool':>6}{'hold-out dB':>14}{'gain vs linear':>17}{'% of per-pixel':>16}")
+    per_pixel = None
+    for factor in (1, 2, 4, 8, 16, 32):
+        tot, cnt = 0.0, 0
+        for c in cached:
+            idx = list(range(len(c["times"])))
+            if len(idx) <= 3:
+                continue
+            for held in idx:
+                tr = [j for j in idx if j != held]
+                e, n = fit_and_eval(
+                    c["residuals"], c["times"], DEGREE_BASIS["cubic"],
+                    tr, [held], smooth=factor,
+                )
+                tot += float(e)
+                cnt += n
+        if cnt == 0:
+            break
+        val = db(tot, cnt)
+        gain = val - lin_out
+        if per_pixel is None:
+            per_pixel = gain
+        share = gain / per_pixel if per_pixel and abs(per_pixel) > 1e-9 else 0.0
+        print(f"{factor:>6}{val:>14.3f}{gain:>17.3f}{share:>15.1%}")
+    print("")
+    print("If the gain collapses as the pool grows, the oracle was fitting")
+    print("per-pixel noise and the realistic ceiling for a CNN is far lower.")
+    print("")
 
     print("\nThe hold-out `gain vs linear` column is the ceiling for stage 1.")
     print("  >1.0 dB    real curvature, worth training")
