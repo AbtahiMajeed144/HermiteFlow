@@ -425,7 +425,7 @@ class Trainer(TrainerTemplate):
                             f"step/{key}", float(parts[key]), "train", opt_step
                         )
                     self.writer.add_scalar(
-                        "step/loss_total", float(loss), "train", opt_step
+                        "step/loss_total", float(loss.detach()), "train", opt_step
                     )
                     self.writer.add_scalar(
                         "step/psnr", float(psnr), "train", opt_step
@@ -458,12 +458,17 @@ class Trainer(TrainerTemplate):
                 # lag badly over thousands of iterations; the leading
                 # `now:` block is the current step so early movement is
                 # actually visible.
+                # .detach() before float(): `loss` still carries grad here,
+                # and converting a grad-tracking tensor to a Python scalar
+                # warns and forces an extra sync.
+                now_loss = float(loss.detach())
+                now_psnr = float(psnr.detach() if torch.is_tensor(psnr) else psnr)
                 line = f"""(ep {epoch} / it {it} / step {opt_step}) """
-                line += f"""now[loss {float(loss):.4f} psnr {float(psnr):.2f} """
+                line += f"""now[loss {now_loss:.4f} psnr {now_psnr:.2f} """
                 if self.stage == 1:
-                    line += f"""(lin {float(parts["psnr_lin"]):.2f}, """
-                    line += f"""gain {float(psnr) - float(parts["psnr_lin"]):+.2f}) """
-                line += f"""d {float(parts["delta_0"]):.4f}] avg["""
+                    now_lin = float(parts["psnr_lin"].detach())
+                    line += f"""(lin {now_lin:.2f}, gain {now_psnr - now_lin:+.2f}) """
+                line += f"""d {float(parts["delta_0"].detach()):.6f}] avg["""
                 line += accm.get_summary().print_line()
                 line += f"""], lr: {scheduler.get_last_lr()[0]:.3e}"""
                 pbar.set_description(line)
