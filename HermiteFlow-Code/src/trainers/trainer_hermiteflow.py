@@ -338,8 +338,16 @@ class Trainer(TrainerTemplate):
         accm = self.get_accm()
         amp_enabled = bool(self.config.experiment.amp)
 
+        # Fixed 10-char bar. tqdm cannot detect the width of a Kaggle
+        # notebook cell, so with a default (elastic) bar the postfix is
+        # what gets clipped - and the postfix is the part worth reading.
         pbar = (
-            tqdm(enumerate(self.loader_trn), total=len(self.loader_trn))
+            tqdm(
+                enumerate(self.loader_trn),
+                total=len(self.loader_trn),
+                bar_format="{desc} {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt} "
+                           "[{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+            )
             if self.distenv.master
             else enumerate(self.loader_trn)
         )
@@ -484,10 +492,11 @@ class Trainer(TrainerTemplate):
                 if self.stage == 1:
                     # 4 decimals: early on, `gain` is thousandths of a dB
                     # and 2 decimals rounds the entire signal away.
+                    # `lin` is omitted here - it is exactly psnr - gain,
+                    # and it is logged to TensorBoard as step/psnr_linear.
                     now_lin = float(parts["psnr_lin"].detach())
-                    postfix["lin"] = f"{now_lin:.4f}"
                     postfix["gain"] = f"{now_psnr - now_lin:+.4f}"
-                postfix["d0"] = f"{float(parts['delta_0'].detach()):.5f}"
+                postfix["d"] = f"{float(parts['delta_0'].detach()):.5f}"
                 postfix["lr"] = f"{scheduler.get_last_lr()[0]:.1e}"
 
                 pbar.set_description(f"ep {epoch}")
