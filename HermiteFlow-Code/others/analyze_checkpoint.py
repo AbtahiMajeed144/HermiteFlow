@@ -51,6 +51,12 @@ def parse_args():
     p.add_argument("--downsample", type=float, default=None)
     p.add_argument("--frame-gap", type=int, default=None)
     p.add_argument("--num-timesteps", type=int, default=None)
+    p.add_argument(
+        "--teacher-raft-iter", type=int, default=None,
+        help="defaults to loss.teacher_raft_iter from the run config; must "
+             "match training or the baseline is measured against a "
+             "different teacher than the model was fitted to",
+    )
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -142,6 +148,17 @@ def main():
         ),
     )
 
+    # The teacher defines the target, so it must be the SAME teacher the
+    # run trained against. Using arch.raft_iter here instead of
+    # loss.teacher_raft_iter silently scores the model against a
+    # different ground truth - it shifted the linear baseline by ~3.5 dB
+    # in practice, which is 100x the effect being measured.
+    teacher_iters = (
+        args.teacher_raft_iter
+        if args.teacher_raft_iter is not None
+        else cfg.get("loss", {}).get("teacher_raft_iter", arch.raft_iter)
+    )
+
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     variants = {"weights": ckpt["state_dict"]}
     if "state_dict_ema" in ckpt:
@@ -152,6 +169,8 @@ def main():
     print(f"data       : gap {ds.frame_gap}, downsample {ds.downsample}, "
           f"K={ds.num_timesteps}, crop {ds.crop_size}, "
           f"{args.num_samples} samples from {args.data_path}")
+    print(f"teacher    : RAFT @ {teacher_iters} iterations "
+          f"(must match training)")
 
     model, _ = create_model(arch, ema=False)
     flavour, handled = match_architecture(model, variants[list(variants)[0]])
@@ -172,7 +191,9 @@ def main():
         gts = [xs[:, :, 2 + k] for k in range(len(times))]
         with torch.no_grad():
             measured = model.measure(img_xs[:, :, 0], img_xs[:, :, 1])
-            teacher = model.teacher_flows(img_xs[:, :, 0], img_xs[:, :, 1], gts)
+            teacher = model.teacher_flows(
+                img_xs[:, :, 0], img_xs[:, :, 1], gts, iters=teacher_iters
+            )
         cache.append({
             "img_xs": img_xs, "times": times, "measured": measured,
             "targets": [tp for tp, _ in teacher],
