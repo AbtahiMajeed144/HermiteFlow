@@ -331,7 +331,7 @@ class HermiteFlowBase(nn.Module):
         phis, psis, holes = [], [], []
 
         if trajectory_only:
-            phis, psis = [], []
+            phis, psis, phis_lin, psis_lin = [], [], [], []
             for cur_t in t:
                 if not torch.is_tensor(cur_t):
                     cur_t = torch.tensor(cur_t, device=img0.device, dtype=img0.dtype)
@@ -340,9 +340,18 @@ class HermiteFlowBase(nn.Module):
                     flow_fwd, coeff_a, coeff_b, cur_t, coeff_c=coeff_c))
                 psis.append(hermite_displacement(
                     flow_bwd, coeff_a_sw, coeff_b_sw, 1.0 - cur_t, coeff_c=coeff_c_sw))
+                # The d = 0 trajectory, i.e. what a purely linear model
+                # would have predicted. Free to compute (one multiply) and
+                # it is the only thing that makes the flow PSNR
+                # interpretable: the gap between the two IS the curvature
+                # contribution, which is the claim the paper rests on.
+                phis_lin.append(cur_t * flow_fwd)
+                psis_lin.append((1.0 - cur_t) * flow_bwd)
             return {
                 "phi": phis,
                 "psi": psis,
+                "phi_linear": phis_lin,
+                "psi_linear": psis_lin,
                 "flow_scale": scale,
                 "delta_norm_0": residuals_0[0].abs().mean().detach(),
                 "delta_norm_1": residuals_0[1].abs().mean().detach(),

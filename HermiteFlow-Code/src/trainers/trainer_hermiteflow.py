@@ -95,6 +95,7 @@ class Trainer(TrainerTemplate):
                 "delta_0",
                 "delta_1",
                 "psnr",
+                "psnr_lin",
             ),
             device=self.device,
         )
@@ -170,6 +171,15 @@ class Trainer(TrainerTemplate):
             loss = loss + self.l1(outputs["psi"][k] / scale, target_psi / scale)
         return loss / (2 * len(teacher))
 
+    @staticmethod
+    def _flow_psnr(preds, targets, scale):
+        """PSNR of a predicted trajectory against the teacher, on the
+        scale-normalised flow so it is comparable across clips."""
+        mse = torch.stack(
+            [(((p - t) / scale) ** 2).mean() for p, t in zip(preds, targets)]
+        ).mean()
+        return -10 * torch.log10(mse.clamp_min(1e-12))
+
     def compute_loss(self, outputs, gts, model_module, teacher=None):
         """
         Average the per-timestep losses. Returns (total, parts dict, psnr).
@@ -186,14 +196,20 @@ class Trainer(TrainerTemplate):
             parts["delta_0"] = outputs["delta_norm_0"].mean()
             parts["delta_1"] = outputs["delta_norm_1"].mean()
             # Flow PSNR, the stage-1 analogue of image PSNR: how well
-            # Phi(t) matches the teacher, on the scale-free flow.
+            # Phi(t) matches the teacher, on the scale-free flow. Reported
+            # alongside the SAME metric for the d = 0 linear trajectory,
+            # because on its own a flow PSNR is uninterpretable - X4K
+            # clips differ enormously in difficulty, so the absolute
+            # number swings by 15 dB between batches while saying nothing
+            # about whether the model is learning. psnr - psnr_lin is the
+            # quantity that matters: dB gained over linear motion.
             with torch.no_grad():
                 scale = outputs["flow_scale"]
-                mse = torch.stack([
-                    (((outputs["phi"][k] - tp) / scale) ** 2).mean()
-                    for k, (tp, _) in enumerate(teacher)
-                ]).mean()
-                psnr = -10 * torch.log10(mse.clamp_min(1e-12))
+                targets = [tp for tp, _ in teacher]
+                psnr = self._flow_psnr(outputs["phi"], targets, scale)
+                parts["psnr_lin"] = self._flow_psnr(
+                    outputs["phi_linear"], targets, scale
+                )
             return distill, parts, psnr
 
         num_targets = len(gts)
@@ -227,6 +243,7 @@ class Trainer(TrainerTemplate):
         else:
             parts["distill"] = torch.zeros((), device=total.device)
 
+        parts["psnr_lin"] = torch.zeros((), device=total.device)
         # Not losses - the collapse diagnostic.
         parts["delta_0"] = outputs["delta_norm_0"].mean()
         parts["delta_1"] = outputs["delta_norm_1"].mean()
@@ -291,6 +308,7 @@ class Trainer(TrainerTemplate):
                     delta_0=parts["delta_0"] * count,
                     delta_1=parts["delta_1"] * count,
                     psnr=psnr_sum,
+                    psnr_lin=parts["psnr_lin"] * count,
                 ),
                 count=count,
                 sync=True,
@@ -392,6 +410,16 @@ class Trainer(TrainerTemplate):
                         self.writer.add_scalar(
                             f"step/{key}", float(parts[key]), "train", opt_step
                         )
+                    if self.stage == 1:
+                        self.writer.add_scalar(
+                            "step/psnr_linear", float(parts["psnr_lin"]),
+                            "train", opt_step,
+                        )
+                        self.writer.add_scalar(
+                            "step/psnr_gain_over_linear",
+                            float(psnr) - float(parts["psnr_lin"]),
+                            "train", opt_step,
+                        )
                     for key in ("delta_0", "delta_1"):
                         self.writer.add_scalar(
                             f"step/{key}", float(parts[key]), "train", opt_step
@@ -419,6 +447,7 @@ class Trainer(TrainerTemplate):
                     delta_0=parts["delta_0"].detach(),
                     delta_1=parts["delta_1"].detach(),
                     psnr=psnr,
+                    psnr_lin=parts["psnr_lin"].detach(),
                 ),
                 count=1,
             )
@@ -431,6 +460,9 @@ class Trainer(TrainerTemplate):
                 # actually visible.
                 line = f"""(ep {epoch} / it {it} / step {opt_step}) """
                 line += f"""now[loss {float(loss):.4f} psnr {float(psnr):.2f} """
+                if self.stage == 1:
+                    line += f"""(lin {float(parts["psnr_lin"]):.2f}, """
+                    line += f"""gain {float(psnr) - float(parts["psnr_lin"]):+.2f}) """
                 line += f"""d {float(parts["delta_0"]):.4f}] avg["""
                 line += accm.get_summary().print_line()
                 line += f"""], lr: {scheduler.get_last_lr()[0]:.3e}"""
@@ -447,6 +479,8 @@ class Trainer(TrainerTemplate):
 
         for key in ("lap", "census", "l1", "psnr", "lpips", "distill"):
             self.writer.add_scalar(f"loss/{key}", summary[key], mode, epoch)
+        if self.stage == 1:
+            self.writer.add_scalar("loss/psnr_lin", summary["psnr_lin"], mode, epoch)
 
         # The collapse diagnostic. If these flatline at zero the model is
         # the linear baseline wearing a cubic costume.
