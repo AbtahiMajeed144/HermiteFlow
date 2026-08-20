@@ -24,6 +24,7 @@ import os
 import sys
 
 import torch
+import torch.nn as nn
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
@@ -52,6 +53,35 @@ def parse_args():
     p.add_argument("--num-timesteps", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
+
+
+def match_architecture(model, state):
+    """
+    Make the constructed model match the checkpoint's architecture.
+
+    Checkpoints written before the GroupNorm branches have no
+    `flow_branch.layers.3` and no `gain`. Loading those with
+    strict=False "works" - and is silently wrong: GroupNorm at init is
+    NOT the identity (weight=1, bias=0 still normalises), so the trunk
+    would run on normalised features it was never trained for and the
+    analysis would report a model that learned nothing.
+
+    Detect it and drop the GroupNorm instead, so the evaluated function
+    is exactly the one that was trained.
+    """
+    has_groupnorm = any(k.endswith("flow_branch.layers.3.weight") for k in state)
+    if has_groupnorm:
+        return "current (GroupNorm branches)", set()
+    for branch in (model.coeff_net.flow_branch, model.coeff_net.rgb_branch):
+        if len(branch.layers) > 3:
+            branch.layers = nn.Sequential(*list(branch.layers)[:3])
+        with torch.no_grad():
+            branch.gain.fill_(1.0)   # unit gain == the legacy behaviour
+    handled = {
+        "coeff_net.flow_branch.gain",
+        "coeff_net.rgb_branch.gain",
+    }
+    return "legacy (pre-GroupNorm; GroupNorm dropped, gains pinned to 1)", handled
 
 
 class Meter:
@@ -124,6 +154,8 @@ def main():
           f"{args.num_samples} samples from {args.data_path}")
 
     model, _ = create_model(arch, ema=False)
+    flavour, handled = match_architecture(model, variants[list(variants)[0]])
+    print(f"architecture: {flavour}")
     model = model.to(device).eval()
 
     # ------------------------------------------------------------------
@@ -183,9 +215,19 @@ def main():
                 f"{config_path}. Point --model-config at the config.yaml "
                 f"from the RUN that produced this checkpoint. Detail: {exc}"
             )
-        starved = [k for k in missing if k.startswith("coeff_net")]
+        # Anything still missing after the architecture match is a real
+        # mismatch and would be evaluated at random init - refuse rather
+        # than quietly report a meaningless number.
+        starved = [
+            k for k in missing if k.startswith("coeff_net") and k not in handled
+        ]
         if starved:
-            print(f"  WARNING: {len(starved)} coeff_net keys missing from '{label}'")
+            sys.exit(
+                f"'{label}' is missing {len(starved)} coeff_net parameters, e.g. "
+                f"{starved[:3]}. These would be evaluated at initialisation, so "
+                f"the result would be meaningless. The checkpoint and the config "
+                f"do not describe the same network."
+            )
 
         for rgb in (True, False):
             model.coeff_net.set_rgb_branch(rgb)
