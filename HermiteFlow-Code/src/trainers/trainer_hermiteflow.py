@@ -479,12 +479,14 @@ class Trainer(TrainerTemplate):
                 now_psnr = float(psnr.detach() if torch.is_tensor(psnr) else psnr)
                 postfix = {
                     "loss": f"{now_loss:.4f}",
-                    "psnr": f"{now_psnr:.2f}",
+                    "psnr": f"{now_psnr:.4f}",
                 }
                 if self.stage == 1:
+                    # 4 decimals: early on, `gain` is thousandths of a dB
+                    # and 2 decimals rounds the entire signal away.
                     now_lin = float(parts["psnr_lin"].detach())
-                    postfix["lin"] = f"{now_lin:.2f}"
-                    postfix["gain"] = f"{now_psnr - now_lin:+.3f}"
+                    postfix["lin"] = f"{now_lin:.4f}"
+                    postfix["gain"] = f"{now_psnr - now_lin:+.4f}"
                 postfix["d0"] = f"{float(parts['delta_0'].detach()):.5f}"
                 postfix["lr"] = f"{scheduler.get_last_lr()[0]:.1e}"
 
