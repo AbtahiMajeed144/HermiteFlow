@@ -77,6 +77,7 @@ class X4KMultiT(Dataset):
         clip_length=DEFAULT_CLIP_LENGTH,
         source="auto",
         repeat=1,
+        downsample=1.0,
     ):
         assert split in ("train", "test"), split
         assert source in ("auto", "mp4", "png"), source
@@ -96,6 +97,26 @@ class X4KMultiT(Dataset):
         self.clip_length = clip_length
         self.if_aug = aug and split == "train"
         self.crop_size = crop_size
+        # Resize each frame by 1/downsample BEFORE cropping.
+        #
+        # X4K's difficulty is temporal, not spatial: a 32-frame gap at
+        # 1000 fps displaces objects ~60 px, which a 256 crop of a 768
+        # clip cannot hold - forward-backward error measured 0.272 at
+        # gap 32 versus 0.011 at gap 16, i.e. RAFT losing the
+        # correspondence entirely. Downsampling divides displacement by
+        # the same factor while keeping the WHOLE field of view, so
+        # nothing moves out of frame.
+        #
+        # Curvature - the thing this model exists to learn - is a ratio
+        # of flow energies and is therefore scale-invariant: dividing
+        # every flow by 3 leaves it untouched. Tracking quality is not.
+        # So this trades spatial detail, which the trajectory model does
+        # not need, for tracking reliability, which it does.
+        #
+        # It also matches how the X4K benchmark actually runs the model:
+        # src/X4K.py evaluates with ds_factor 0.5 (2K) and 0.25 (4K).
+        self.downsample = float(downsample)
+        assert self.downsample >= 1.0, "downsample is a shrink factor, >= 1"
         # X-TRAIN has only ~4.4k clips, but each one yields many distinct
         # samples: a random 32-frame window out of 65, a random crop, and
         # random flips. One pass over the clip list is therefore a very
@@ -250,9 +271,21 @@ class X4KMultiT(Dataset):
         return [found[i] for i in indices]
 
     def _load(self, clip, indices):
-        if self.source == "png":
-            return self._read_png(clip, indices)
-        return self._read_mp4(clip, indices)
+        frames = (
+            self._read_png(clip, indices) if self.source == "png"
+            else self._read_mp4(clip, indices)
+        )
+        if frames is None or self.downsample == 1.0:
+            return frames
+        height, width = frames[0].shape[:2]
+        size = (
+            max(8, int(round(width / self.downsample))),
+            max(8, int(round(height / self.downsample))),
+        )
+        # INTER_AREA is the correct (area-averaging) filter for shrinking;
+        # bilinear would alias the high frequencies straight into the
+        # flow estimate.
+        return [cv2.resize(f, size, interpolation=cv2.INTER_AREA) for f in frames]
 
     # ------------------------------------------------------------------
     # Augmentation (applied identically to every frame of the sample)

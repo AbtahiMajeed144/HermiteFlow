@@ -61,6 +61,8 @@ def parse_args():
         help="must each be divisible by --num-divisions",
     )
     p.add_argument("--num-divisions", type=int, default=8)
+    p.add_argument("--downsample", type=float, default=1.0,
+                   help="shrink each frame by this factor before cropping")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -88,7 +90,7 @@ def main():
         ds = X4KMultiT(
             "train", args.data_path, num_timesteps=1, aug=True,
             crop_size=args.crop_size, frame_gap=gap,
-            num_divisions=args.num_divisions,
+            num_divisions=args.num_divisions, downsample=args.downsample,
         )
         stats = {k: [] for k in ("mean", "p95", "max", "oob", "us", "gate", "curv")}
 

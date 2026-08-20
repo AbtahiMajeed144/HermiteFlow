@@ -34,6 +34,7 @@ def create_dataset(config, is_eval=False, logger=None):
             num_divisions=config.dataset.get("num_divisions", 8),
             clip_length=config.dataset.get("clip_length", 65),
             source=config.dataset.get("source", "auto"),
+            downsample=config.dataset.get("downsample", 1.0),
         )
         repeat = config.dataset.get("repeat", 1)
         dataset_trn = X4KMultiT(
