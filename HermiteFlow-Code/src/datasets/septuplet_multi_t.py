@@ -177,7 +177,9 @@ class VimeoSeptupletMultiT(Dataset):
 
     def _augment(self, frames, times):
         height, width = frames[0].shape[:2]
-        crop = min(self.crop_size, height, width)
+        # Multiple of 8: RAFT's H//8 grid and its ceil-strided conv stack
+        # disagree otherwise, and grid_sample fails with a batch mismatch.
+        crop = ((min(self.crop_size, height, width)) // 8) * 8
         top = random.randint(0, height - crop)
         left = random.randint(0, width - crop)
         frames = [f[top : top + crop, left : left + crop, :] for f in frames]

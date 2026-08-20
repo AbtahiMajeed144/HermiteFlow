@@ -291,9 +291,29 @@ class X4KMultiT(Dataset):
     # Augmentation (applied identically to every frame of the sample)
     # ------------------------------------------------------------------
 
+    def _crop_extent(self, height, width):
+        """
+        Largest usable square crop, rounded DOWN to a multiple of 8.
+
+        RAFT computes its coordinate grid as H//8 but its conv stack
+        reduces by ceil(H/2) three times. For H = 172 those disagree
+        (21 vs 22) and grid_sample dies with a batch-size mismatch. Any
+        multiple of 8 is safe; nothing else is. This bites whenever the
+        frame ends up smaller than crop_size - e.g. 4K validation frames
+        after `downsample`, which is exactly where it first showed up.
+        """
+        crop = min(self.crop_size, height, width)
+        crop = (crop // 8) * 8
+        if crop < 8:
+            raise ValueError(
+                f"frame is {height}x{width} after downsample={self.downsample}; "
+                f"too small to crop. Lower dataset.downsample."
+            )
+        return crop
+
     def _augment(self, frames, times):
         height, width = frames[0].shape[:2]
-        crop = min(self.crop_size, height, width)
+        crop = self._crop_extent(height, width)
         top = random.randint(0, height - crop)
         left = random.randint(0, width - crop)
         frames = [f[top : top + crop, left : left + crop, :] for f in frames]
@@ -322,7 +342,7 @@ class X4KMultiT(Dataset):
 
     def _center_crop(self, frames):
         height, width = frames[0].shape[:2]
-        crop = min(self.crop_size, height, width)
+        crop = self._crop_extent(height, width)
         top, left = (height - crop) // 2, (width - crop) // 2
         return [f[top : top + crop, left : left + crop, :] for f in frames]
 
