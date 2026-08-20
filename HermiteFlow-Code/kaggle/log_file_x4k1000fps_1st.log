@@ -1,0 +1,124 @@
+08/20/2026 05:38:46 - INFO - main.py -   DistEnv(world_size=1, world_rank=0, local_rank=0, num_gpus=2, master=True, device_name='Tesla T4')
+08/20/2026 05:38:46 - INFO - main.py -   log_path: /kaggle/working/runs/hermiteflow_r_x4k/20082026_053846
+08/20/2026 05:38:46 - INFO - main.py -   
+arch:
+  type: hermiteflow_r
+  ema: true
+  ema_value: null
+  pretrained_raft_ckpt: /kaggle/input/models/xenon144/raft-things/pytorch/default/1/raft-things.pth
+  pretrained_flowformer_ckpt: pretrained/flowformer_sintel.pth
+  raft_iter: 20
+  min_flow_scale: 1.0
+  coeff_net_channels: 64
+  gate_init_bias: 5.0
+  gate_init_scale: 20.0
+  use_rgb_branch: true
+  train_stage: 2
+  degree: cubic
+  refine_net_channels: 64
+  refine_net_blocks: 3
+  use_splat_importance: true
+  splat_impl: torch
+  synth_net_channels: 64
+dataset:
+  transforms:
+    type: null
+  type: x4k_multi_t
+  path: /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/encoded_train
+  val_path: /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/val
+  source: auto
+  frame_gap: 32
+  num_divisions: 8
+  clip_length: 65
+  num_timesteps: 5
+  crop_size: 256
+  aug: true
+  repeat: 8
+optimizer:
+  type: adamw
+  max_gn: 1.0
+  warmup:
+    mode: fix
+    start_from_zero: true
+    epoch: 1
+    multiplier: 1
+    buffer_epoch: 0
+    min_lr: 2.0e-05
+  init_lr: 0.0002
+  weight_decay: 4.0e-05
+  betas:
+  - 0.9
+  - 0.999
+  ft: true
+  grad_accm_steps: 4
+experiment:
+  test_freq: 5
+  amp: true
+  batch_size: 8
+  total_batch_size: 32
+  num_workers: 4
+  log_every: 50
+  epochs: 60
+  save_ckpt_freq: 1
+  test_imlog_freq: 5
+loss:
+  type: mse
+  subsample:
+    type: null
+    ratio: 1.0
+  coord_noise: null
+  perceptual_loss: true
+  flow_distill_weight: 0.1
+  teacher_raft_iter: 12
+trainer: stage_inr
+seed: 0
+runtime:
+  args:
+    model_config: /kaggle/working/HermiteFlow/HermiteFlow-Code/configs/hermiteflow/hermiteflow_r_x4k.yaml
+    result_path: /kaggle/working/runs
+    load_path: ''
+    postfix: ''
+    seed: 0
+    eval: false
+    resume: false
+    data_path: /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/encoded_train
+    val_path: /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/val
+    num_timesteps: null
+    raft_ckpt: /kaggle/input/models/xenon144/raft-things/pytorch/default/1/raft-things.pth
+    flowformer_ckpt: null
+    world_size: 1
+    local_rank: 0
+    node_rank: -1
+    nnodes: -1
+    nproc_per_node: -1
+    dist_backend: nccl
+    timeout: 86400
+    rank: 0
+  extra_config:
+    dataset:
+      path: /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/encoded_train
+      val_path: /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/val
+    arch:
+      pretrained_raft_ckpt: /kaggle/input/models/xenon144/raft-things/pytorch/default/1/raft-things.pth
+  distenv:
+    world_size: 1
+    world_rank: 0
+    local_rank: 0
+    num_gpus: 2
+    master: true
+    device_name: Tesla T4
+result_path: /kaggle/working/runs/hermiteflow_r_x4k/20082026_053846
+
+08/20/2026 05:38:46 - INFO - main.py -   source copied to /kaggle/working/runs/hermiteflow_r_x4k/20082026_053846/src
+08/20/2026 05:38:49 - INFO - main.py -   #train samples: 35264, #valid samples: 15
+08/20/2026 05:38:50 - INFO - main.py -   [OPTION: ALL] #parameters: 14.2083M
+08/20/2026 05:38:50 - INFO - main.py -   [OPTION: trainable-only] #parameters: 8.9496M
+08/20/2026 05:38:50 - INFO - main.py -   
+[MODULE BREAKDOWN]
+08/20/2026 05:38:50 - INFO - main.py -     flow_estimator:             5.2575M (trainable:   0.0000M, frozen:   5.2575M)
+08/20/2026 05:38:50 - INFO - main.py -     coeff_net:                  4.3995M (trainable:   4.3983M, frozen:   0.0012M)
+08/20/2026 05:38:50 - INFO - main.py -     flow_reversal:              0.2274M (trainable:   0.2274M, frozen:   0.0000M)
+08/20/2026 05:38:50 - INFO - main.py -     synthesis:                  4.3238M (trainable:   4.3238M, frozen:   0.0000M)
+08/20/2026 05:38:50 - INFO - main.py -     TOTAL:                     14.2083M (trainable:   8.9496M, frozen:   5.2587M)
+
+08/20/2026 05:38:52 - INFO - main.py -   Trainer created. type: <class 'trainers.trainer_hermiteflow.Trainer'>

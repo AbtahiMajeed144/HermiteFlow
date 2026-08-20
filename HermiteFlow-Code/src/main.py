@@ -171,6 +171,21 @@ if __name__ == "__main__":
         )
         steps_per_epoch = steps_per_epoch // config.optimizer.grad_accm_steps
 
+        # `optimizer.ft` is GIMM-VFI's stage-2 grouping: it drops the
+        # PRE-TRAINED modules to 0.01x lr so a stage-1 solution is not
+        # destroyed. With no stage-1 checkpoint to protect there is
+        # nothing pre-trained, and the only effect is to train CoeffNet
+        # and RefineNet 100x too slowly - which looks exactly like the
+        # curvature failing to learn, only after hours of wall clock.
+        if config.optimizer.get("ft", False) and not args.load_path:
+            raise ValueError(
+                "optimizer.ft=true fine-tunes the motion modules at 0.01x lr, "
+                "but no --load-path was given, so there is nothing pre-trained "
+                "to protect. For stage 2 from a stage-1 checkpoint, pass "
+                "--load-path <stage1-run>/epochN_model.pt ; to train from "
+                "scratch in a single stage, pass optimizer.ft=false"
+            )
+
         optimizer = create_optimizer(model, config)
         scheduler = create_scheduler(
             optimizer,
