@@ -405,30 +405,35 @@ class Trainer(TrainerTemplate):
 
                 opt_step += 1
                 if self.distenv.master and opt_step % self.log_every == 0:
-                    # Instantaneous, not the epoch running mean.
+                    # Instantaneous, not the epoch running mean. Detach
+                    # first: several of these still carry grad, and float()
+                    # on a grad-tracking tensor warns and forces a sync.
+                    def scalar(v):
+                        return float(v.detach() if torch.is_tensor(v) else v)
+
                     for key in ("lap", "census", "l1", "lpips", "distill"):
                         self.writer.add_scalar(
-                            f"step/{key}", float(parts[key]), "train", opt_step
+                            f"step/{key}", scalar(parts[key]), "train", opt_step
                         )
                     if self.stage == 1:
                         self.writer.add_scalar(
-                            "step/psnr_linear", float(parts["psnr_lin"]),
+                            "step/psnr_linear", scalar(parts["psnr_lin"]),
                             "train", opt_step,
                         )
                         self.writer.add_scalar(
                             "step/psnr_gain_over_linear",
-                            float(psnr) - float(parts["psnr_lin"]),
+                            scalar(psnr) - scalar(parts["psnr_lin"]),
                             "train", opt_step,
                         )
                     for key in ("delta_0", "delta_1"):
                         self.writer.add_scalar(
-                            f"step/{key}", float(parts[key]), "train", opt_step
+                            f"step/{key}", scalar(parts[key]), "train", opt_step
                         )
                     self.writer.add_scalar(
-                        "step/loss_total", float(loss.detach()), "train", opt_step
+                        "step/loss_total", scalar(loss), "train", opt_step
                     )
                     self.writer.add_scalar(
-                        "step/psnr", float(psnr), "train", opt_step
+                        "step/psnr", scalar(psnr), "train", opt_step
                     )
                     self.writer.add_scalar(
                         "step/lr", scheduler.get_last_lr()[0], "train", opt_step
@@ -454,24 +459,28 @@ class Trainer(TrainerTemplate):
             total_step += 1
 
             if self.distenv.master:
-                # `accm` holds running means over the epoch so far, which
-                # lag badly over thousands of iterations; the leading
-                # `now:` block is the current step so early movement is
-                # actually visible.
-                # .detach() before float(): `loss` still carries grad here,
-                # and converting a grad-tracking tensor to a Python scalar
-                # warns and forces an extra sync.
+                # Keep the description short so tqdm still has room for the
+                # bar, rate and ETA; metrics go in the postfix. These are
+                # INSTANTANEOUS values - the epoch running means are logged
+                # at epoch end and to TensorBoard, and over thousands of
+                # iterations a running mean lags too badly to be useful
+                # here. Everything is detached: several still carry grad,
+                # and float() on those warns and forces a device sync.
                 now_loss = float(loss.detach())
                 now_psnr = float(psnr.detach() if torch.is_tensor(psnr) else psnr)
-                line = f"""(ep {epoch} / it {it} / step {opt_step}) """
-                line += f"""now[loss {now_loss:.4f} psnr {now_psnr:.2f} """
+                postfix = {
+                    "loss": f"{now_loss:.4f}",
+                    "psnr": f"{now_psnr:.2f}",
+                }
                 if self.stage == 1:
                     now_lin = float(parts["psnr_lin"].detach())
-                    line += f"""(lin {now_lin:.2f}, gain {now_psnr - now_lin:+.2f}) """
-                line += f"""d {float(parts["delta_0"].detach()):.6f}] avg["""
-                line += accm.get_summary().print_line()
-                line += f"""], lr: {scheduler.get_last_lr()[0]:.3e}"""
-                pbar.set_description(line)
+                    postfix["lin"] = f"{now_lin:.2f}"
+                    postfix["gain"] = f"{now_psnr - now_lin:+.3f}"
+                postfix["d0"] = f"{float(parts['delta_0'].detach()):.5f}"
+                postfix["lr"] = f"{scheduler.get_last_lr()[0]:.1e}"
+
+                pbar.set_description(f"ep {epoch}")
+                pbar.set_postfix(postfix, refresh=False)
 
         summary = accm.get_summary()
         summary["xs"] = batch["xs"]
