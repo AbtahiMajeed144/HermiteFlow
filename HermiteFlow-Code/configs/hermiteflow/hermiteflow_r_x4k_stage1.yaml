@@ -122,7 +122,7 @@ experiment:
   # cards, so batch_size=4 is 2 per card = 5.6 GiB at K=5. Under DDP
   # batch_size is per process, so 4 means 11.3 GiB per card - still fits,
   # but drop to 2 if you also raise crop_size or K.
-  batch_size: 16
+  batch_size: 32
   total_batch_size: 32
   num_workers: 4
   # Write scalars every N optimizer steps. Epoch-granularity logging is
