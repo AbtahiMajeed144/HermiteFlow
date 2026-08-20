@@ -129,7 +129,7 @@ experiment:
   # blind here - an epoch is ~1-2k optimizer steps, i.e. hours.
   log_every: 50
   # Stage 1 is much cheaper per step (no synthesis forward/backward,
-  # no Laplacian/census/LPIPS), so it can afford many more epochs.
+  # no Laplacian/census/LPIPS), so it can afford many more epochs. 
   # GIMM trains its stage 1 for 240.
   epochs: 120
   # Kaggle sessions are capped (9-12 h) and a full run will not finish
