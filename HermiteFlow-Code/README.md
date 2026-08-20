@@ -186,6 +186,48 @@ Decoding cost is set by the *last* frame needed, not by how many are kept, so
 raising `K` costs no extra I/O — only the per-`t` compute of phases 3–5. `K=7`
 is the best-conditioned setting either dataset offers.
 
+### Two-stage training, after GIMM-VFI
+
+GIMM-VFI trains in two stages (paper §7.3 / Tab. 5; repo `configs/gimm` then
+`configs/gimmvfi`), and HermiteFlow mirrors it. `arch.train_stage` selects.
+
+| | GIMM (stage 1) | GIMM-VFI (stage 2) | HermiteFlow s1 | HermiteFlow s2 |
+| --- | --- | --- | --- | --- |
+| trains | GIMM only | AMT @ lr, GIMM+RAFT @ 0.01× | CoeffNet only | SynthNet @ lr, CoeffNet+RefineNet @ 0.01× |
+| objective | MSE on flow | image losses + λ·L_rec | trajectory distillation | image losses + 0.1·distill |
+| peak LR | 1e-4 const | 8e-5 cosine, 1ep warmup | 1e-4 const | 2e-4 cosine, 1ep warmup |
+| weight decay | 0 | 4e-5 | 0 | 4e-5 |
+| epochs | 240 | 60 | 120 | 60 |
+
+```bash
+# stage 1 — motion only; phases 4-5 skipped and frozen
+python src/main.py -m configs/hermiteflow/hermiteflow_r_x4k_stage1.yaml     --result-path ./runs --data-path <x4k>/encoded_train --val-path <x4k>/val
+
+# stage 2 — joint, initialised from stage 1
+python src/main.py -m configs/hermiteflow/hermiteflow_r_x4k.yaml     --result-path ./runs --data-path <x4k>/encoded_train --val-path <x4k>/val     --load-path ./runs/<stage1-run>/epoch120_model.pt
+```
+
+**Why stage 1 exists.** It is the same reason GIMM gives: get the motion model
+right *before* a synthesis module exists that can absorb its errors. Stage 1
+skips phases 4–5 entirely, so it is much cheaper per step (no synthesis
+forward/backward, no Laplacian/census/LPIPS) and can afford many more epochs.
+In stage 1 the reported `psnr` is **flow**-PSNR against the teacher, not image
+PSNR — nothing is rendered.
+
+**Why the flow term survives into stage 2.** It becomes GIMM's `L_rec`: no
+longer the objective, but a regulariser that stops the pre-trained motion model
+drifting once image gradients start flowing. That is exactly what
+`loss.flow_distill_weight: 0.1` is doing in the stage-2 config.
+
+**`optimizer.ft: true`** reproduces GIMM's stage-2 parameter grouping — fresh
+module at full LR, pre-trained modules at 0.01× LR and 0.01× weight decay. Set
+it to `false` if you train stage 2 from scratch without a stage-1 checkpoint.
+
+One deliberate difference: GIMM fine-tunes its flow estimator in stage 2 (it
+lands in the 0.01× group). HermiteFlow keeps RAFT **frozen throughout**, because
+`learned_hermite_vfi.md` specifies it as frozen and Phase 1 is meant to be the
+one real measurement in the pipeline.
+
 ### The two things that make curvature learnable at all
 
 **Multiple `t` per clip.** At a single `t` only the combination

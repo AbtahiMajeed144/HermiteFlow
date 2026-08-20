@@ -87,6 +87,9 @@ experiment:
   batch_size: 4
   # Kaggle sessions have 4 CPUs; raise on a bigger host.
   num_workers: 4
+  # Write scalars every N optimizer steps. Epoch-granularity logging is
+  # blind here - an epoch is ~1-2k optimizer steps, i.e. hours.
+  log_every: 50
   total_batch_size: 32
   epochs: 60
   save_ckpt_freq: 10

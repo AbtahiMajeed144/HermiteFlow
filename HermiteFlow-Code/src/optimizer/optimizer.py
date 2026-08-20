@@ -2,32 +2,72 @@
 # HermiteFlow — optimizer factory
 # Adapted from GIMM-VFI's optimizer.py
 #
-# Everything that is trainable is trained: CoeffNet (Phase 2),
-# RefineNet (Phase 4) and SynthNet (Phase 5). The flow estimator
-# (Phase 1) is frozen and Phase 3 has no parameters at all, so
-# both are absent from the parameter list by construction.
+# Everything trainable is trained: CoeffNet (Phase 2), RefineNet
+# (Phase 4) and SynthNet (Phase 5). The flow estimator (Phase 1) is
+# frozen and Phase 3 has no parameters, so both are absent from the
+# parameter list by construction.
+#
+# `optimizer.ft: true` reproduces GIMM-VFI's stage-2 grouping. There,
+# the freshly-initialised synthesis module (`amt_*`) trains at the full
+# learning rate while the *pre-trained* motion module fine-tunes at
+# 0.01x with 0.01x weight decay, so stage-1 knowledge is not destroyed
+# in the first few hundred steps. The same split applies here: Phase 5
+# is new in stage 2, Phases 2 and 4 arrive pre-trained.
 # --------------------------------------------------------
 
 import torch
 
+# Modules that arrive pre-trained from stage 1 and should therefore be
+# fine-tuned gently rather than retrained.
+PRETRAINED_PREFIXES = ("coeff_net", "flow_reversal")
+
+
+def _split_params(model):
+    fresh, pretrained = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith(PRETRAINED_PREFIXES):
+            pretrained.append(param)
+        else:
+            fresh.append(param)
+    return fresh, pretrained
+
 
 def create_hermiteflow_optimizer(model, config):
     optimizer_type = config.type.lower()
+    finetune = bool(getattr(config, "ft", False))
 
-    params = [p for p in model.parameters() if p.requires_grad]
-    if len(params) == 0:
-        raise ValueError("no trainable parameters found")
+    if finetune:
+        fresh, pretrained = _split_params(model)
+        param_dicts = []
+        if fresh:
+            param_dicts.append({"params": fresh})
+        if pretrained:
+            param_dicts.append(
+                {
+                    "params": pretrained,
+                    "lr": config.init_lr * 0.01,
+                    "weight_decay": config.weight_decay * 0.01,
+                }
+            )
+        if not param_dicts:
+            raise ValueError("no trainable parameters found")
+    else:
+        param_dicts = [p for p in model.parameters() if p.requires_grad]
+        if len(param_dicts) == 0:
+            raise ValueError("no trainable parameters found")
 
     kwargs = dict(lr=config.init_lr, weight_decay=config.weight_decay)
     if optimizer_type in ("adamw", "adam"):
         kwargs["betas"] = tuple(config.betas)
 
     if optimizer_type == "adamw":
-        return torch.optim.AdamW(params, **kwargs)
+        return torch.optim.AdamW(param_dicts, **kwargs)
     if optimizer_type == "adam":
-        return torch.optim.Adam(params, **kwargs)
+        return torch.optim.Adam(param_dicts, **kwargs)
     if optimizer_type == "sgd":
-        return torch.optim.SGD(params, momentum=0.9, **kwargs)
+        return torch.optim.SGD(param_dicts, momentum=0.9, **kwargs)
 
     raise ValueError(f"{optimizer_type} invalid..")
 

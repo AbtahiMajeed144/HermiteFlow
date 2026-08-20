@@ -1,7 +1,4 @@
-# HermiteFlow on X4K1000FPS, RAFT backbone — STAGE 2 (joint).
-#
-# Initialise from a stage-1 checkpoint:
-#   ... -m configs/hermiteflow/hermiteflow_r_x4k.yaml \n#       --load-path <stage1-run>/epochN_model.pt
+# HermiteFlow on X4K1000FPS, RAFT backbone — STAGE 1 (motion only).
 #
 # This is the dataset the model is actually for. Vimeo motion is
 # near-linear, so F alone explains it and the curvature heads have
@@ -11,7 +8,7 @@
 # Kaggle launch (train reads mp4 directly - decoding X-TRAIN to PNG
 # would cost ~240 GB and does not fit):
 #
-#   python src/main.py -m configs/hermiteflow/hermiteflow_r_x4k.yaml \
+#   python src/main.py -m configs/hermiteflow/hermiteflow_r_x4k_stage1.yaml \
 #       --result-path /kaggle/working/runs \
 #       --data-path /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/encoded_train \
 #       --val-path  /kaggle/input/datasets/mdrifaturrahman33/x4k1000fps/val \
@@ -73,9 +70,11 @@ arch:
   # Phase 3 - trajectory degree: linear | quadratic | cubic | quartic
   degree: cubic
 
-  # Joint training. Phases 2 and 4 arrive pre-trained from stage 1;
-  # phase 5 is new. See optimizer.ft below.
-  train_stage: 2
+  # Motion only: phases 4-5 are skipped and frozen, the objective is
+  # trajectory distillation alone. GIMM's stage 1 is the same idea -
+  # train the motion module by itself on a flow loss before the
+  # synthesis module exists to absorb its errors.
+  train_stage: 1
 
   # Phase 4
   refine_net_channels: 64
@@ -87,11 +86,11 @@ arch:
   synth_net_channels: 64
 
 loss:
-  perceptual_loss: True
-  # In stage 2 this is GIMM's L_rec: it is no longer the objective but
-  # a regulariser that stops the pre-trained motion model drifting once
-  # the synthesis module starts absorbing error.
-  flow_distill_weight: 0.1
+  # No image losses in stage 1 - nothing is rendered.
+  perceptual_loss: False
+  # Trajectory distillation against the frozen estimator run on the
+  # ground-truth middle frames. Costs 2*K extra flow passes per step.
+  flow_distill_weight: 1.0
   # The teacher runs 2*K frozen flow passes per step. At raft_iter=20
   # and K=5 that measured 901 ms against 658 ms for the entire rest of
   # the step; 12 iterations cuts it to 528 ms and the target is only
@@ -100,21 +99,18 @@ loss:
 
 optimizer:
   type: adamw
-  init_lr: 0.0002
-  weight_decay: 0.00004
+  # GIMM's stage 1 uses a constant 1e-4 with no warmup and no weight
+  # decay (paper Tab. 5). Same here.
+  init_lr: 0.0001
+  weight_decay: 0.0
   betas: [0.9, 0.999]
-  # GIMM-VFI's stage-2 grouping: the fresh synthesis module trains at
-  # init_lr, the pre-trained motion modules at 0.01x with 0.01x weight
-  # decay. Set false to train everything at one rate (correct if you
-  # are NOT resuming from a stage-1 checkpoint).
-  ft: true
   warmup:
-    epoch: 1
+    epoch: 0
     multiplier: 1
     buffer_epoch: 0
-    min_lr: 0.00002
+    min_lr: 0.0001
     mode: fix
-    start_from_zero: True
+    start_from_zero: False
   max_gn: 1.0
 
 experiment:
@@ -132,7 +128,10 @@ experiment:
   # Write scalars every N optimizer steps. Epoch-granularity logging is
   # blind here - an epoch is ~1-2k optimizer steps, i.e. hours.
   log_every: 50
-  epochs: 60
+  # Stage 1 is much cheaper per step (no synthesis forward/backward,
+  # no Laplacian/census/LPIPS), so it can afford many more epochs.
+  # GIMM trains its stage 1 for 240.
+  epochs: 120
   # Kaggle sessions are capped (9-12 h) and a full run will not finish
   # in one. Checkpoint every epoch so a timeout costs at most one, and
   # chain sessions with --resume --load-path <ckpt>.

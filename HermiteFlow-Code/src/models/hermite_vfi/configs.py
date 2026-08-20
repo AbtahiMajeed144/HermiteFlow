@@ -40,6 +40,20 @@ class HermiteFlowConfig:
     # checkpoint runs either way and the flow branch needs no retraining.
     use_rgb_branch: bool = True
 
+    # ---- Training stage ----
+    # Mirrors GIMM-VFI's two-stage recipe (paper Tab. 5, repo
+    # configs/gimm + configs/gimmvfi):
+    #   1 = motion only. Phases 1-3 run, phases 4-5 are skipped and
+    #       frozen, and the only objective is trajectory distillation
+    #       against pseudo-ground-truth flow. GIMM's stage 1 is exactly
+    #       this: train the motion module alone on an MSE flow loss.
+    #   2 = joint. Everything trains on image losses, with the flow
+    #       term retained as a regulariser - GIMM's L_rec, which exists
+    #       to stop the pre-trained motion module drifting once the
+    #       synthesis module starts absorbing error.
+    # Stage 2 is initialised from a stage-1 checkpoint via --load-path.
+    train_stage: int = 2
+
     # ---- Phase 3: trajectory degree ----
     # Experiment (2): "linear" (d_i = 0, RIFE-style) | "quadratic"
     # (B = 0, IQ-VFI) | "cubic" (ours) | "quartic" (adds C*beta4, the

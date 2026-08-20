@@ -54,3 +54,9 @@ class ExponentialMovingAverage(torch.nn.Module):
 
     def get_recon_imgs(self, *args, **kwargs):
         return self.module.get_recon_imgs(*args, **kwargs)
+
+    def teacher_flows(self, *args, **kwargs):
+        # The teacher is the frozen flow estimator, so the EMA copy and
+        # the live model would return identical targets; delegating keeps
+        # the trainer from having to care which one it holds.
+        return self.module.teacher_flows(*args, **kwargs)

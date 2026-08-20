@@ -68,6 +68,20 @@ class Trainer(TrainerTemplate):
         self.teacher_raft_iter = int(
             getattr(self.config.loss, "teacher_raft_iter", 12)
         )
+        # Write scalars every N optimizer steps. Logging once per epoch is
+        # useless here: a Vimeo epoch is ~2k optimizer steps and an X4K
+        # one with repeat=8 is ~1.1k, so the first point would land hours
+        # in, long after you need to know whether d0/d1 are moving.
+        self.log_every = int(self.config.experiment.get("log_every", 50))
+        # Two-stage recipe, after GIMM-VFI. Stage 1 trains the motion
+        # model alone against pseudo-ground-truth flow; stage 2 trains
+        # everything on image losses and keeps the flow term as GIMM's
+        # L_rec regulariser.
+        self.stage = int(getattr(self.config.arch, "train_stage", 2))
+        if self.stage == 1 and self.flow_distill_weight <= 0:
+            raise ValueError(
+                "stage 1 has no objective without loss.flow_distill_weight > 0"
+            )
 
     def get_accm(self):
         return AccmStageINR(
@@ -159,7 +173,29 @@ class Trainer(TrainerTemplate):
     def compute_loss(self, outputs, gts, model_module, teacher=None):
         """
         Average the per-timestep losses. Returns (total, parts dict, psnr).
+
+        Stage 1 has no image term at all: phases 4-5 never ran, so the
+        only objective is the trajectory distillation, exactly as GIMM's
+        stage 1 optimises an MSE flow loss on the motion module alone.
         """
+        if self.stage == 1:
+            zero = torch.zeros((), device=outputs["flow_scale"].device)
+            distill = self.trajectory_loss(outputs, teacher)
+            parts = {k: zero for k in ("lap", "census", "l1", "lpips")}
+            parts["distill"] = distill
+            parts["delta_0"] = outputs["delta_norm_0"].mean()
+            parts["delta_1"] = outputs["delta_norm_1"].mean()
+            # Flow PSNR, the stage-1 analogue of image PSNR: how well
+            # Phi(t) matches the teacher, on the scale-free flow.
+            with torch.no_grad():
+                scale = outputs["flow_scale"]
+                mse = torch.stack([
+                    (((outputs["phi"][k] - tp) / scale) ** 2).mean()
+                    for k, (tp, _) in enumerate(teacher)
+                ]).mean()
+                psnr = -10 * torch.log10(mse.clamp_min(1e-12))
+            return distill, parts, psnr
+
         num_targets = len(gts)
         parts = {"lap": 0.0, "census": 0.0, "l1": 0.0, "lpips": 0.0}
         psnr = 0.0
@@ -216,14 +252,33 @@ class Trainer(TrainerTemplate):
         model.eval()
         for _it, batch in pbar:
             img_xs, gts, t_list = self.unpack(batch, self.device)
-            outputs = model(img_xs, t=t_list, return_diagnostics=False)
+            teacher = None
+            if self.stage == 1 or self.flow_distill_weight > 0:
+                teacher = model_module.teacher_flows(
+                    img_xs[:, :, 0], img_xs[:, :, 1], gts,
+                    iters=self.teacher_raft_iter,
+                )
+            outputs = model(
+                img_xs,
+                t=t_list,
+                return_diagnostics=False,
+                return_trajectory=teacher is not None,
+                trajectory_only=self.stage == 1,
+            )
 
-            total, parts, _psnr = self.compute_loss(outputs, gts, model_module)
+            total, parts, _psnr = self.compute_loss(
+                outputs, gts, model_module, teacher=teacher
+            )
             count = img_xs.shape[0]
-            psnr_sum = sum(
-                model_module.compute_psnr(outputs["imgt_pred"][k], gt, reduction="sum")
-                for k, gt in enumerate(gts)
-            ) / len(gts)
+            if self.stage == 1:
+                psnr_sum = _psnr * count
+            else:
+                psnr_sum = sum(
+                    model_module.compute_psnr(
+                        outputs["imgt_pred"][k], gt, reduction="sum"
+                    )
+                    for k, gt in enumerate(gts)
+                ) / len(gts)
 
             accm.update(
                 dict(
@@ -275,6 +330,8 @@ class Trainer(TrainerTemplate):
         optimizer.zero_grad(set_to_none=True)
 
         is_ddp = isinstance(model, torch.nn.parallel.DistributedDataParallel)
+        steps_per_epoch = max(1, len(self.loader_trn) // self.grad_accm_steps)
+        opt_step = epoch * steps_per_epoch
 
         for it, batch in pbar:
             img_xs, gts, t_list = self.unpack(batch, self.device)
@@ -328,6 +385,27 @@ class Trainer(TrainerTemplate):
                 if model_ema:
                     model_ema.module.update(model.module, total_step)
 
+                opt_step += 1
+                if self.distenv.master and opt_step % self.log_every == 0:
+                    # Instantaneous, not the epoch running mean.
+                    for key in ("lap", "census", "l1", "lpips", "distill"):
+                        self.writer.add_scalar(
+                            f"step/{key}", float(parts[key]), "train", opt_step
+                        )
+                    for key in ("delta_0", "delta_1"):
+                        self.writer.add_scalar(
+                            f"step/{key}", float(parts[key]), "train", opt_step
+                        )
+                    self.writer.add_scalar(
+                        "step/loss_total", float(loss), "train", opt_step
+                    )
+                    self.writer.add_scalar(
+                        "step/psnr", float(psnr), "train", opt_step
+                    )
+                    self.writer.add_scalar(
+                        "step/lr", scheduler.get_last_lr()[0], "train", opt_step
+                    )
+
             accm.update(
                 dict(
                     loss_total=loss.detach(),
@@ -347,9 +425,15 @@ class Trainer(TrainerTemplate):
             total_step += 1
 
             if self.distenv.master:
-                line = f"""(epoch {epoch} / iter {it}) """
+                # `accm` holds running means over the epoch so far, which
+                # lag badly over thousands of iterations; the leading
+                # `now:` block is the current step so early movement is
+                # actually visible.
+                line = f"""(ep {epoch} / it {it} / step {opt_step}) """
+                line += f"""now[loss {float(loss):.4f} psnr {float(psnr):.2f} """
+                line += f"""d {float(parts["delta_0"]):.4f}] avg["""
                 line += accm.get_summary().print_line()
-                line += f""", lr: {scheduler.get_last_lr()[0]:e}"""
+                line += f"""], lr: {scheduler.get_last_lr()[0]:.3e}"""
                 pbar.set_description(line)
 
         summary = accm.get_summary()
@@ -381,6 +465,8 @@ class Trainer(TrainerTemplate):
     @torch.no_grad()
     def reconstruct(self, summary, epoch=0, mode="valid"):
         """Log the ground truth and the prediction for every supervised t."""
+        if self.stage == 1:
+            return  # stage 1 never renders a frame
         model = self.model_ema if "ema" in mode else self.model
         model.eval()
 

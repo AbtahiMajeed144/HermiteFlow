@@ -67,6 +67,8 @@ class HermiteFlowBase(nn.Module):
         self.min_flow_scale = config.min_flow_scale
         self.degree = config.degree
         self.use_splat_importance = config.use_splat_importance
+        self.train_stage = int(config.train_stage)
+        assert self.train_stage in (1, 2), "arch.train_stage must be 1 or 2"
         assert self.degree in RESIDUALS_PER_DEGREE, (
             f"arch.degree must be one of {tuple(RESIDUALS_PER_DEGREE)}, "
             f"got {self.degree}"
@@ -114,6 +116,15 @@ class HermiteFlowBase(nn.Module):
 
         # ===== Phase 5: synthesize =====
         self.synthesis = FrameSynthesis(channels=config.synth_net_channels)
+
+        # Stage 1 trains the motion model alone. Phases 4-5 are skipped in
+        # the forward pass, so their parameters would receive no gradient -
+        # a hard error under DDP with find_unused_parameters=False. They
+        # stay in the state_dict so stage 2 can resume from the checkpoint.
+        if self.train_stage == 1:
+            for module in (self.flow_reversal, self.synthesis):
+                for param in module.parameters():
+                    param.requires_grad = False
 
     # ------------------------------------------------------------------
     # Backbone hooks
@@ -243,6 +254,7 @@ class HermiteFlowBase(nn.Module):
         ds_factor=None,
         return_diagnostics=True,
         return_trajectory=False,
+        trajectory_only=None,
     ):
         """
         Args:
@@ -261,11 +273,17 @@ class HermiteFlowBase(nn.Module):
             return_trajectory: additionally return Phi(t) and Phi'(t) only.
                        The trajectory-distillation loss needs these two and
                        nothing else, so it does not pay for the rest.
+            trajectory_only: stop after Phase 3 and return no images.
+                       Defaults to True in stage 1, where phases 4-5 are
+                       frozen and there is no image loss - running them
+                       would be pure waste. Pass explicitly to override.
 
         Returns:
             dict; "imgt_pred" is a list of (B, 3, H, W) frames, one per t.
         """
         assert isinstance(t, (list, tuple)) and len(t) > 0, "t must be a non-empty list"
+        if trajectory_only is None:
+            trajectory_only = self.train_stage == 1 and self.training
 
         full_size_img = None
         if ds_factor is not None and abs(ds_factor - 1.0) > 1e-6:
@@ -311,6 +329,24 @@ class HermiteFlowBase(nn.Module):
 
         imgt_preds, flowt0_preds, flowt1_preds, all_others = [], [], [], []
         phis, psis, holes = [], [], []
+
+        if trajectory_only:
+            phis, psis = [], []
+            for cur_t in t:
+                if not torch.is_tensor(cur_t):
+                    cur_t = torch.tensor(cur_t, device=img0.device, dtype=img0.dtype)
+                cur_t = cur_t.to(device=img0.device, dtype=img0.dtype).reshape(-1, 1, 1, 1)
+                phis.append(hermite_displacement(
+                    flow_fwd, coeff_a, coeff_b, cur_t, coeff_c=coeff_c))
+                psis.append(hermite_displacement(
+                    flow_bwd, coeff_a_sw, coeff_b_sw, 1.0 - cur_t, coeff_c=coeff_c_sw))
+            return {
+                "phi": phis,
+                "psi": psis,
+                "flow_scale": scale,
+                "delta_norm_0": residuals_0[0].abs().mean().detach(),
+                "delta_norm_1": residuals_0[1].abs().mean().detach(),
+            }
 
         for cur_t in t:
             if not torch.is_tensor(cur_t):
