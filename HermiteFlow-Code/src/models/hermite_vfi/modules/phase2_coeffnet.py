@@ -1,5 +1,5 @@
 # --------------------------------------------------------
-# HermiteFlow — Phase 2: Predict endpoint velocities
+# HermiteFlow - Phase 2: Predict endpoint velocities
 #
 #   In:  I0, I1, F, F', U      Out: m0, m1      (no t)
 #
@@ -15,6 +15,14 @@
 #     ADDITION, not concatenation - with concat, zeroing the RGB
 #     half changes the input distribution of the fusion conv and
 #     the flow branch would have to be retrained to compensate.
+#
+#     Each branch ends in GroupNorm and carries a learnable scalar
+#     gain. Without this the two branches see very different input
+#     distributions (unit-scale normalised flow vs raw RGB) and
+#     nothing forces them to contribute comparably - the RGB branch
+#     could be silently suppressed, and ablation (1) would come back
+#     flat for an architectural reason rather than a scientific one.
+#     Log both gains during training.
 #
 # 2.2 Two heads.
 #       d0, d1 = heads(Xi)
@@ -77,18 +85,34 @@ class OcclusionGate(nn.Module):
 
 
 class _Branch(nn.Module):
-    """Stem for one input branch, producing `channels` feature maps."""
+    """
+    Stem for one input branch, producing `channels` feature maps.
 
-    def __init__(self, in_channels, channels):
+    Ends in GroupNorm plus a learnable scalar gain so the flow and RGB
+    branches are on comparable footing before they are summed. The flow
+    branch sees unit-scale normalised input; the RGB branch sees raw
+    images. Without normalisation nothing forces the two to contribute
+    comparably, and a suppressed RGB branch would make ablation (1) come
+    back flat for an architectural reason rather than a scientific one.
+
+    The gain is also a measurement: if the RGB gain grows relative to
+    the flow gain, the network is choosing to use image context, which
+    is evidence for the RGB-curvature claim independent of the on/off
+    ablation.
+    """
+
+    def __init__(self, in_channels, channels, groups=8):
         super().__init__()
         self.layers = nn.Sequential(
             nn.Conv2d(in_channels, channels, 3, 1, 1),
             nn.LeakyReLU(0.1, inplace=True),
             LateralBlock(channels),
+            nn.GroupNorm(groups, channels),
         )
+        self.gain = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
-        return self.layers(x)
+        return self.gain * self.layers(x)
 
 
 class CoeffNet(nn.Module):
@@ -101,6 +125,11 @@ class CoeffNet(nn.Module):
     predicted residuals are multiplied by s on the way out. The network
     therefore sees a scale-free problem while its predictions stay
     dimensionally correct - double the motion, double the residuals.
+
+    Because that output multiplication also multiplies the gradient
+    reaching the head convolutions by s (tens to hundreds of pixels),
+    the heads see an effective learning rate far above the rest of the
+    network. Build the optimizer with `param_groups()`.
     """
 
     def __init__(
@@ -110,10 +139,12 @@ class CoeffNet(nn.Module):
         gate_init_scale=20.0,
         use_rgb_branch=True,
         num_residuals=2,
+        deep=False,
     ):
         super().__init__()
         self.use_rgb_branch = use_rgb_branch
         self.num_residuals = num_residuals
+        self.deep = deep
 
         c1, c2, c3 = channels, channels * 2, channels * 4
 
@@ -135,6 +166,28 @@ class CoeffNet(nn.Module):
             LateralBlock(c3),
             LateralBlock(c3),
         )
+
+        # Optional third downsample, bottleneck at H/8 instead of H/4.
+        # OFF by default. The hypothesis is that object-scale context is
+        # needed for the RGB-curvature claim and H/4 may not cover a fast
+        # object at 1080p - but that is speculation, and it costs ~1.6M
+        # parameters in a network whose parameter count is already the
+        # awkward number next to GIMM's 0.25M motion module. Turn it on
+        # only if large-displacement benchmarks (X-TEST, SNU-FILM
+        # extreme) underperform. Channels stay at c3 rather than
+        # doubling, since down2 already holds most of the parameters.
+        if deep:
+            self.down3 = nn.Sequential(
+                nn.Conv2d(c3, c3, 3, 2, 1),
+                nn.LeakyReLU(0.1, inplace=True),
+                LateralBlock(c3),
+            )
+            self.up0 = nn.Sequential(
+                nn.Conv2d(c3 + c3, c3, 3, 1, 1),
+                nn.LeakyReLU(0.1, inplace=True),
+                LateralBlock(c3),
+            )
+
         self.up1 = nn.Sequential(
             nn.Conv2d(c3 + c2, c2, 3, 1, 1),
             nn.LeakyReLU(0.1, inplace=True),
@@ -162,9 +215,11 @@ class CoeffNet(nn.Module):
         self.num_active_heads = num_residuals
         self.set_rgb_branch(use_rgb_branch)
 
+    # ---------------- runtime switches ----------------
+
     def set_rgb_branch(self, enabled):
         """
-        Runtime switch for ablation ①. No retraining, no reshaping.
+        Runtime switch for ablation (1). No retraining, no reshaping.
 
         Also flips requires_grad: a branch that never contributes to the
         output receives no gradient, and DDP with
@@ -172,6 +227,10 @@ class CoeffNet(nn.Module):
         removes it from DDP's bucket and from the optimizer, while the
         weights stay in the state_dict so one checkpoint still serves
         both arms of the ablation.
+
+        Rebuild the optimizer after calling this - a frozen parameter
+        left in an AdamW group keeps drifting under weight decay despite
+        receiving no gradient.
         """
         self.use_rgb_branch = bool(enabled)
         for param in self.rgb_branch.parameters():
@@ -181,15 +240,54 @@ class CoeffNet(nn.Module):
         """
         Keep only the heads the configured degree actually consumes.
 
+          1 head  -> quadratic (B = 0), matches IQ-VFI's single term
+          2 heads -> cubic, ours
+          3 heads -> quartic, ablation upper end
+
         The module always builds enough heads for the widest degree so
         that a single checkpoint serves the whole degree ablation, but
         the unused ones must be frozen for the same DDP reason as above.
+        Rebuild the optimizer after calling this.
         """
         assert 1 <= num_used <= len(self.heads)
         self.num_active_heads = num_used
         for index, head in enumerate(self.heads):
             for param in head.parameters():
                 param.requires_grad = index < num_used
+
+    def param_groups(self, lr, head_lr_divisor=50.0, weight_decay=0.0):
+        """
+        Optimizer parameter groups.
+
+        The residuals are returned as `head(feat) * alpha * scale`, so
+        the gradient reaching the head weights carries a factor of
+        `scale` - tens to hundreds of pixels, and varying per sample.
+        With a shared learning rate the heads train far faster than the
+        trunk, and the instability lands in the first few thousand
+        steps, which is exactly when the zero-initialised heads are
+        leaving the linear baseline. Adam's per-parameter normalisation
+        absorbs some of this, so treat the divisor as insurance; if
+        training is stable with a single group, drop it.
+
+        Weight decay is disabled on the heads and on the scalar
+        parameters (branch gains, gate) - decaying a zero-initialised
+        head just fights the signal you are trying to grow.
+        """
+        head_params, scalar_params, trunk_params = [], [], []
+        for name, param in self.named_parameters():
+            if name.startswith("heads."):
+                head_params.append(param)
+            elif name.endswith(".gain") or name.startswith("gate."):
+                scalar_params.append(param)
+            else:
+                trunk_params.append(param)
+        return [
+            {"params": trunk_params, "lr": lr, "weight_decay": weight_decay},
+            {"params": head_params, "lr": lr / head_lr_divisor, "weight_decay": 0.0},
+            {"params": scalar_params, "lr": lr, "weight_decay": 0.0},
+        ]
+
+    # ---------------- forward ----------------
 
     def forward(
         self,
@@ -212,8 +310,8 @@ class CoeffNet(nn.Module):
             scale:            (B, 1, 1, 1)  s,        pixels
 
         Returns:
-            residuals: list of `num_residuals` tensors (B, 2, H, W), in
-                       pixels, occlusion-gated. [d0, d1] (+ d2).
+            residuals: list of `num_active_heads` tensors (B, 2, H, W),
+                       in pixels, occlusion-gated. [d0, d1] (+ d2).
         """
         occlusion_norm = occlusion / scale
 
@@ -231,6 +329,13 @@ class CoeffNet(nn.Module):
         f2 = self.down1(f1)
         f3 = self.down2(f2)
 
+        if self.deep:
+            f4 = self.down3(f3)
+            u0 = F.interpolate(
+                f4, size=f3.shape[-2:], mode="bilinear", align_corners=False
+            )
+            f3 = self.up0(torch.cat([u0, f3], dim=1))
+
         u1 = F.interpolate(f3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.up1(torch.cat([u1, f2], dim=1))
         u2 = F.interpolate(u1, size=f1.shape[-2:], mode="bilinear", align_corners=False)
@@ -241,6 +346,9 @@ class CoeffNet(nn.Module):
             self.heads[i](u2) * alpha * scale
             for i in range(self.num_active_heads)
         ]
+
+
+# ---------------- helpers ----------------
 
 
 def run_both_sides(
@@ -260,6 +368,14 @@ def run_both_sides(
 
         lattice 0:  (I0, backwarp(I1, F ), F , backwarp(F', F ), U )
         lattice 1:  (I1, backwarp(I0, F'), F', backwarp(F , F'), U')
+
+    Note that occ_bwd must be computed ON LATTICE 1, i.e.
+
+        occ_bwd = || F' + backwarp(F, F') ||_1
+
+    and is NOT occ_fwd warped across. Getting this wrong is silent - the
+    shapes match and training proceeds, but the gate fires in the wrong
+    places on the frame-1 side.
 
     Args:
         align: callable(tensor_on_other_lattice, flow) -> aligned tensor.
@@ -283,3 +399,42 @@ def run_both_sides(
         [r[:batch] for r in residuals],
         [r[batch:] for r in residuals],
     )
+
+
+@torch.no_grad()
+def residual_stats(residuals, scale, prefix="coeff"):
+    """
+    Diagnostic for the headline claim. Log this from the first few
+    thousand steps, not after a full run.
+
+    If the residual magnitudes stay near zero the network has fallen
+    back to linear motion and the contribution does not exist yet -
+    the failure mode the Time Lens++ ablation predicts, and one that
+    zero-init makes easy to slide into.
+
+    Watch the relative figure: absolute pixel magnitude is meaningless
+    without the clip's motion scale. Note also that `scale` is one
+    number per clip, set by the fastest content, so static background
+    will show small residuals for a numerical reason as well as a
+    semantic one - read the spatial maps, not just these scalars.
+    """
+    stats = {}
+    for i, residual in enumerate(residuals):
+        magnitude = residual.norm(dim=1)
+        stats[f"{prefix}/d{i}_px"] = magnitude.mean().item()
+        stats[f"{prefix}/d{i}_rel"] = (magnitude.mean() / scale.mean()).item()
+        stats[f"{prefix}/d{i}_p99_px"] = magnitude.flatten().quantile(0.99).item()
+    return stats
+
+
+@torch.no_grad()
+def branch_gains(coeff_net, prefix="coeff"):
+    """
+    Second piece of evidence for the RGB claim, independent of the
+    on/off ablation. If the RGB gain grows relative to the flow gain,
+    the network is choosing to use image context.
+    """
+    return {
+        f"{prefix}/gain_flow": coeff_net.flow_branch.gain.item(),
+        f"{prefix}/gain_rgb": coeff_net.rgb_branch.gain.item(),
+    }
