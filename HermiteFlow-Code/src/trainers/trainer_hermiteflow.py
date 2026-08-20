@@ -345,8 +345,12 @@ class Trainer(TrainerTemplate):
             tqdm(
                 enumerate(self.loader_trn),
                 total=len(self.loader_trn),
-                bar_format="{desc} {percentage:3.0f}%|{bar:10}| {n_fmt}/{total_fmt} "
-                           "[{elapsed}<{remaining}, {rate_fmt}]{postfix}",
+                # ncols pins the total width so tqdm neither pads to a
+                # guessed terminal size nor lets the bar grow and push
+                # the metrics out of view.
+                ncols=110,
+                bar_format="{desc} {percentage:3.0f}%|{bar:6}|{n_fmt}/{total_fmt} "
+                           "[{elapsed}<{remaining},{rate_fmt}]{postfix}",
             )
             if self.distenv.master
             else enumerate(self.loader_trn)
@@ -483,23 +487,26 @@ class Trainer(TrainerTemplate):
                 # iterations a running mean lags too badly to be useful
                 # here. Everything is detached: several still carry grad,
                 # and float() on those warns and forces a device sync.
+                # Short keys and no leading zeros: a Kaggle output pane
+                # clips horizontally rather than wrapping, so anything
+                # past ~110 characters is simply invisible. Everything
+                # here is also in TensorBoard (step/*) and in the
+                # epoch-end log line, which is where to read exact
+                # values; this is a glance, not a record.
                 now_loss = float(loss.detach())
                 now_psnr = float(psnr.detach() if torch.is_tensor(psnr) else psnr)
-                postfix = {
-                    "loss": f"{now_loss:.4f}",
-                    "psnr": f"{now_psnr:.4f}",
-                }
+                postfix = {"L": f"{now_loss:.4f}", "P": f"{now_psnr:.3f}"}
                 if self.stage == 1:
-                    # 4 decimals: early on, `gain` is thousandths of a dB
-                    # and 2 decimals rounds the entire signal away.
-                    # `lin` is omitted here - it is exactly psnr - gain,
-                    # and it is logged to TensorBoard as step/psnr_linear.
+                    # 4 decimals on the gain: early on it is thousandths
+                    # of a dB and coarser rounding hides the whole signal.
+                    # `lin` is omitted - it is exactly P - g, and it is
+                    # logged to TensorBoard as step/psnr_linear.
                     now_lin = float(parts["psnr_lin"].detach())
-                    postfix["gain"] = f"{now_psnr - now_lin:+.4f}"
-                postfix["d"] = f"{float(parts['delta_0'].detach()):.5f}"
-                postfix["lr"] = f"{scheduler.get_last_lr()[0]:.1e}"
+                    postfix["g"] = f"{now_psnr - now_lin:+.4f}"
+                postfix["d"] = f"{float(parts['delta_0'].detach()):.4f}"
+                postfix["lr"] = f"{scheduler.get_last_lr()[0]:.0e}"
 
-                pbar.set_description(f"ep {epoch}")
+                pbar.set_description(f"ep{epoch}")
                 pbar.set_postfix(postfix, refresh=False)
 
         summary = accm.get_summary()
