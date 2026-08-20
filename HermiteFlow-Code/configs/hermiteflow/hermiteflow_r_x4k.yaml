@@ -44,6 +44,22 @@ dataset:
   # if memory is tight, and lower experiment.batch_size with it.
   num_timesteps: 5
   crop_size: 256
+  # Shrink each frame by this factor BEFORE cropping. X-TRAIN clips are
+  # 768x768, so 3.0 gives exactly 256x256 with the whole field of view.
+  #
+  # Measured on X4K at frame_gap 32 (others/inspect_x4k_motion.py):
+  #            |F|     out-of-crop   U/s     gate    curvature
+  #   native   61.5px     4.4%      0.272    0.867     17.0 dB
+  #   ds 3.0   22.1px     0.0%      0.012    0.991     17.1 dB
+  #
+  # Tracking improves 23x while the curvature signal - the thing the
+  # model exists to learn - is untouched, because curvature is a ratio
+  # of flow energies and so is scale-invariant. Cropping instead would
+  # throw away 8/9 of the scene AND leave the motion untrackable.
+  #
+  # Note 3.0 makes the random crop a no-op (frame == crop_size). Use
+  # 2.5 (768 -> 307) if you want crop jitter back as an augmentation.
+  downsample: 3.0
   aug: true
   # X-TRAIN is only ~4.4k clips, but each yields many distinct samples
   # (random 32-frame window out of 65, random crop, random flips). One
