@@ -438,6 +438,15 @@ class Trainer(TrainerTemplate):
                     self.writer.add_scalar(
                         "step/lr", scheduler.get_last_lr()[0], "train", opt_step
                     )
+                    # Peak motion of the batch, in pixels. If this is a
+                    # large fraction of crop_size the flow has nothing to
+                    # match against and every downstream signal is noise.
+                    if "flow_scale" in outputs:
+                        self.writer.add_scalar(
+                            "step/flow_scale_px",
+                            scalar(outputs["flow_scale"].mean()),
+                            "train", opt_step,
+                        )
 
             accm.update(
                 dict(
