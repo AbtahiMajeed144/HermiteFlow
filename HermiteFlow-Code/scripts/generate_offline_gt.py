@@ -7,8 +7,8 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 import cv2
 
-# Add src to pythonpath so it can resolve models/datasets/etc.
-sys.path.append(os.path.abspath("src"))
+# Add src to pythonpath so it can resolve models/datasets/etc. before global packages
+sys.path.insert(0, os.path.abspath("src"))
 
 from models import create_model
 from datasets import create_dataset
