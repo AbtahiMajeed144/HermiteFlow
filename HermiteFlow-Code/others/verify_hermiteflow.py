@@ -31,7 +31,8 @@ import math
 import torch
 from omegaconf import OmegaConf
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from models.hermite_vfi.configs import HermiteFlowConfig  # noqa: E402
 from models.hermite_vfi.hermiteflow_base import HermiteFlowBase  # noqa: E402
@@ -333,6 +334,32 @@ def test_residual_bound():
         out = net2(*args)
     check("zero-init heads still start exactly at the linear baseline",
           all(r.abs().max().item() < TOL for r in out))
+
+
+def test_configs_match_schema():
+    print(chr(10) + "5c. Shipped YAML configs merge into the schema")
+    # Adding a key to a YAML without adding the dataclass field passes
+    # every unit test here - CoeffNet is built directly - and then dies
+    # at OmegaConf.merge on the training host, minutes into a run. The
+    # only place that mismatch is visible is the merge itself, so do it.
+    import glob
+    from omegaconf import OmegaConf
+    from models.hermite_vfi.configs import HermiteFlowConfig
+
+    schema = OmegaConf.structured(HermiteFlowConfig)
+    paths = sorted(glob.glob(os.path.join(ROOT, "configs", "hermiteflow", "*.yaml")))
+    check("there are configs to check", len(paths) > 0, f"{len(paths)} found")
+    for path in paths:
+        name = os.path.basename(path)
+        arch = OmegaConf.load(path).get("arch", None)
+        if arch is None:
+            continue
+        try:
+            OmegaConf.merge(schema, arch)
+            ok, detail = True, ""
+        except Exception as exc:
+            ok, detail = False, str(exc).splitlines()[0]
+        check(f"[{name}] arch keys all exist in HermiteFlowConfig", ok, detail)
 
 
 def test_occlusion_gate():
@@ -688,6 +715,7 @@ def main():
     test_degree_switch()
     test_occlusion_gate()
     test_residual_bound()
+    test_configs_match_schema()
     test_rgb_branch_switch()
     test_splat()
     test_splat_backends()

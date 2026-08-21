@@ -39,6 +39,23 @@ class HermiteFlowConfig:
     # by addition, so this is a pure runtime switch - the same
     # checkpoint runs either way and the flow branch needs no retraining.
     use_rgb_branch: bool = True
+    # Hard cap on |d_i|, in units of the motion scale s, applied with a
+    # tanh so the map is exactly linear for small residuals.
+    #
+    # Phase 3 observes the residuals only through
+    #     Phi(t) - t F = beta2(t) [ (t - 1) d0 + t d1 ]
+    # whose singular values over t in k/8 are 0.334 and 0.097: the
+    # symmetric mode d0 ~ +d1 shifts the trajectory 7.7x less than the
+    # antisymmetric one, by 0.043 px per pixel of residual. The loss
+    # barely constrains that direction, but Adam normalises away
+    # gradient magnitude and steps along it at full size regardless, so
+    # the residuals random-walk. A stage-1 run reached |d0| = 1183 px
+    # while its loss was still 0.026, then overflowed to NaN.
+    #
+    # The oracle wants ~0.375 s, so the default 2.0 sits ~5x clear of
+    # any real solution: distortion is 7.5e-06 at the |d| training
+    # currently reaches. It binds only when a run is already diverging.
+    residual_bound: float = 2.0
 
     # ---- Training stage ----
     # Mirrors GIMM-VFI's two-stage recipe (paper Tab. 5, repo

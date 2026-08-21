@@ -90,7 +90,7 @@ class HermiteFlowBase(nn.Module):
             gate_init_scale=config.gate_init_scale,
             use_rgb_branch=config.use_rgb_branch,
             num_residuals=max(RESIDUALS_PER_DEGREE.values()),
-            residual_bound=getattr(config, "residual_bound", 2.0),
+            residual_bound=config.residual_bound,
         )
         # Heads the configured degree does not consume are frozen and not
         # evaluated: an unused parameter is a hard error under DDP with
