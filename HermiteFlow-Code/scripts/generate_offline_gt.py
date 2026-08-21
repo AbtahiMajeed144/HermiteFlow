@@ -44,6 +44,9 @@ def main():
     args, extra_args = parse_args()
     set_seed(args.seed)
     
+    # single_setup requires args.eval to be True
+    args.eval = True
+    
     # Setup configuration (works for non-ddp scripts)
     config = single_setup(args, extra_args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
