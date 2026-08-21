@@ -24,6 +24,11 @@ def parse_args():
     parser.add_argument("--num-splits", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("-r", "--result-path", type=str, default="./results.tmp")
+    parser.add_argument("-l", "--load-path", type=str, default="")
+    parser.add_argument("-p", "--postfix", type=str, default="")
     
     # Overrides matching main.py
     parser.add_argument("--data-path", type=str, default=None)
