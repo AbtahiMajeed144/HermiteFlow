@@ -27,6 +27,7 @@ Run from the HermiteFlow-Code root:
 import os
 import sys
 
+import math
 import torch
 from omegaconf import OmegaConf
 
@@ -283,6 +284,55 @@ def test_degree_switch():
           .abs().max().item() < TOL
           and (hermite_displacement(flow, a_x, b_x, torch.ones(2), coeff_c=c_x)
                - flow).abs().max().item() < 1e-4)
+
+
+def test_residual_bound():
+    print(chr(10) + "5b. Bounded velocity residuals")
+    # The trajectory loss sees the residuals only through
+    # beta2(t)[(t-1) d0 + t d1], which constrains the symmetric mode
+    # d0 ~ d1 far more weakly than the antisymmetric one. Adam ignores
+    # gradient magnitude, so that soft direction can random-walk away.
+    # tanh caps it. Two things must both hold: the cap must be HARD,
+    # and it must be invisible at the magnitudes real training uses.
+    bound = 2.0
+    net = CoeffNet(channels=16, residual_bound=bound)
+    scale = torch.full((2, 1, 1, 1), 20.0)
+    args = (torch.rand(2, 3, 32, 32), torch.rand(2, 3, 32, 32),
+            torch.randn(2, 2, 32, 32), torch.randn(2, 2, 32, 32),
+            torch.zeros(2, 1, 32, 32), scale)
+
+    # Drive the heads far past any plausible solution.
+    for head in net.heads:
+        torch.nn.init.normal_(head.weight, std=5.0)
+        torch.nn.init.normal_(head.bias, std=50.0)
+    with torch.no_grad():
+        blown = net(*args)
+    cap = bound * scale.max().item()
+    worst = max(r.abs().max().item() for r in blown)
+    check("|d_i| is capped at residual_bound * s under extreme weights",
+          worst <= cap + TOL, f"max |d| = {worst:.2f} px, cap = {cap:.2f} px")
+    check("the capped output is finite",
+          all(torch.isfinite(r).all().item() for r in blown))
+
+    # At the magnitude the oracle actually wants (~0.375 s) the tanh
+    # must be the identity to well under measurement noise, otherwise
+    # the cap would quietly bias the science.
+    want = 0.375
+    err = abs(bound * math.tanh(want / bound) - want) / want
+    check("cap is numerically inert at the oracle's |d| ~ 0.375 s",
+          err < 0.02, f"relative distortion {err:.3%}")
+    at_current = 0.19 / 20.0
+    err2 = abs(bound * math.tanh(at_current / bound) - at_current) / at_current
+    check("cap is inert at the |d| training currently reaches",
+          err2 < 1e-4, f"relative distortion {err2:.2e}")
+
+    # Small-signal gradient must be untouched: heads are zero-init, so
+    # a changed slope at zero would change how training leaves linear.
+    net2 = CoeffNet(channels=16, residual_bound=bound)
+    with torch.no_grad():
+        out = net2(*args)
+    check("zero-init heads still start exactly at the linear baseline",
+          all(r.abs().max().item() < TOL for r in out))
 
 
 def test_occlusion_gate():
@@ -637,6 +687,7 @@ def main():
     test_linear_baseline()
     test_degree_switch()
     test_occlusion_gate()
+    test_residual_bound()
     test_rgb_branch_switch()
     test_splat()
     test_splat_backends()

@@ -57,6 +57,8 @@ class Trainer(TrainerTemplate):
         for _name, param in self.lpips.named_parameters():
             param.requires_grad = False
         self.grad_accm_steps = max(1, int(self.config.optimizer.grad_accm_steps))
+        # Micro-batches dropped for a non-finite loss; see train().
+        self.nonfinite_skips = 0
         self.flow_distill_weight = float(
             getattr(self.config.loss, "flow_distill_weight", 0.0)
         )
@@ -399,6 +401,33 @@ class Trainer(TrainerTemplate):
                     loss, parts, psnr = self.compute_loss(
                         outputs, gts, model_module, teacher=teacher
                     )
+
+                # A non-finite loss must never reach .backward(): it
+                # writes NaN into every weight it touches and the run is
+                # unrecoverable from that point on - the whole optimizer
+                # state is poisoned, not just the step. Skipping the
+                # micro-batch costs one sample; not skipping it costs the
+                # run. GradScaler already skips on inf GRADIENTS, but it
+                # cannot see a loss that was non-finite to begin with.
+                # The decision must be COLLECTIVE. Under DDP .backward()
+                # runs an all-reduce, so a rank that skips it while its
+                # peer does not leaves that peer waiting on a collective
+                # that never arrives - the job hangs instead of crashing.
+                # All-reduce the flag first so every rank skips together.
+                bad = torch.tensor(
+                    [0.0 if torch.isfinite(loss) else 1.0], device=loss.device
+                )
+                if self.distenv.world_size > 1:
+                    torch.distributed.all_reduce(bad)
+                if bad.item() > 0:
+                    self.nonfinite_skips += 1
+                    if self.nonfinite_skips <= 10 and self.distenv.master:
+                        logger.warning(
+                            "non-finite loss at step %d, micro-batch skipped "
+                            "(%d so far)", total_step, self.nonfinite_skips
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
 
                 scaler.scale(loss / self.grad_accm_steps).backward()
 

@@ -130,6 +130,22 @@ class CoeffNet(nn.Module):
     reaching the head convolutions by s (tens to hundreds of pixels),
     the heads see an effective learning rate far above the rest of the
     network. Build the optimizer with `param_groups()`.
+
+    Bounded output. Phase 3 observes the residuals only through
+
+        Phi(t) - t F = beta2(t) [ (t - 1) d0 + t d1 ]
+
+    so the map (d0, d1) -> trajectory is ill-conditioned: over t in
+    k/8, the antisymmetric mode d0 = -d1 moves the trajectory ~7.7x
+    more than the symmetric mode d0 = +d1, which shifts it by only
+    0.043 px per pixel of residual. That flat direction is not free -
+    Adam normalises per-parameter gradient magnitude, so a direction
+    the loss barely constrains still receives a full ~lr step, and the
+    residuals random-walk along it. Observed directly: a run at
+    lr 5e-4 reached |d0| = 1183 px while the loss was still 0.026,
+    then overflowed. tanh caps |d_i| at `residual_bound * s`, which at
+    the default 2.0 sits ~5x above anything the oracle asks for, so it
+    binds only when the run is already diverging.
     """
 
     def __init__(
@@ -140,11 +156,13 @@ class CoeffNet(nn.Module):
         use_rgb_branch=True,
         num_residuals=2,
         deep=False,
+        residual_bound=2.0,
     ):
         super().__init__()
         self.use_rgb_branch = use_rgb_branch
         self.num_residuals = num_residuals
         self.deep = deep
+        self.residual_bound = float(residual_bound)
 
         c1, c2, c3 = channels, channels * 2, channels * 4
 
@@ -342,8 +360,16 @@ class CoeffNet(nn.Module):
         u2 = self.up2(torch.cat([u2, f1], dim=1))
 
         alpha = self.gate(occlusion_norm)
+        # Saturating output. See the class docstring: the symmetric mode
+        # d0 ~ d1 is nearly invisible to the trajectory loss, so nothing
+        # in the objective stops it drifting. tanh caps |d_i| at
+        # bound * s while staying EXACTLY linear for small arguments -
+        # at the magnitudes the oracle actually wants (~0.375 s) this is
+        # numerically the identity, so it changes no result, it only
+        # removes the escape.
+        bound = self.residual_bound
         return [
-            self.heads[i](u2) * alpha * scale
+            alpha * bound * scale * torch.tanh(self.heads[i](u2) / bound)
             for i in range(self.num_active_heads)
         ]
 
