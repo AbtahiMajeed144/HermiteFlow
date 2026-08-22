@@ -14,6 +14,7 @@ import torch
 from .flow_dataset import fast_vimeo_flow, vimeo_rgb_with_flow
 from .septuplet_multi_t import VimeoSeptupletMultiT
 from .vimeo_arb import Vimeo_Arbitrary
+from .x4k_cached import X4KCachedGT
 from .x4k_multi_t import X4KMultiT
 
 from utils.env import env_flag
@@ -22,7 +23,34 @@ SMOKE_TEST = env_flag("SMOKE_TEST")
 
 
 def create_dataset(config, is_eval=False, logger=None):
-    if config.dataset.type == "x4k_multi_t":
+    if config.dataset.type == "x4k_cached":
+        # Stage 1 with the frozen teacher precomputed. Training reads the
+        # cache; validation stays on the online loader, because it needs
+        # real middle frames for image metrics and is small enough that
+        # the teacher cost there does not matter.
+        common = dict(
+            num_timesteps=config.dataset.get("num_timesteps", 5),
+            crop_size=config.dataset.get("crop_size", 256),
+            frame_gap=config.dataset.get("frame_gap", 32),
+            num_divisions=config.dataset.get("num_divisions", 8),
+            clip_length=config.dataset.get("clip_length", 65),
+            source=config.dataset.get("source", "auto"),
+            downsample=config.dataset.get("downsample", 1.0),
+        )
+        dataset_trn = X4KCachedGT(
+            config.dataset.cache_path,
+            num_timesteps=config.dataset.get("num_timesteps", 5),
+            aug=config.dataset.aug,
+            repeat=config.dataset.get("repeat", 1),
+            expect={
+                "num_divisions": config.dataset.get("num_divisions", 8),
+                "frame_gap": config.dataset.get("frame_gap", 32),
+                "downsample": config.dataset.get("downsample", 1.0),
+            },
+        )
+        val_path = config.dataset.get("val_path", None) or config.dataset.path
+        dataset_val = X4KMultiT("test", val_path, aug=False, **common)
+    elif config.dataset.type == "x4k_multi_t":
         # X4K1000FPS. `path` is the training root (mp4 or png); `val_path`
         # points at the already-decoded validation frames. Both are
         # searched recursively, so the doubled directories in the Kaggle

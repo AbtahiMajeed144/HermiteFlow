@@ -362,6 +362,74 @@ def test_configs_match_schema():
         check(f"[{name}] arch keys all exist in HermiteFlowConfig", ok, detail)
 
 
+def test_flow_augmentation():
+    print(chr(10) + "5d. Cached-teacher flow augmentation is exact")
+    # The cache stores one unaugmented entry per clip and the loader
+    # reapplies flips and rotations to the images and the flows together.
+    # A sign error here is invisible at runtime - training would just
+    # distil against a corrupted target and quietly learn nothing - so
+    # check the rule rather than trusting the derivation.
+    #
+    # A displacement transforms the way a difference of points does:
+    #     R d = T(p + d) - T(p)
+    # T is recovered by pushing an id map through the SAME function under
+    # test, so this compares the flow rule against the array
+    # manipulation, not against a hand-derived matrix.
+    import numpy as np
+    from datasets.x4k_cached import X4KCachedGT
+
+    size = 24
+    rng = np.random.default_rng(0)
+    flow = np.stack([
+        (rng.integers(-3, 4, (size, size)) + np.arange(size)[None, :] // 9),
+        (rng.integers(-3, 4, (size, size)) - np.arange(size)[:, None] // 9),
+    ]).astype(np.float32)
+    ids = np.zeros((size, size, 3), dtype=np.int32)
+    ids[:, :, 0] = np.arange(size * size).reshape(size, size)
+
+    cases = {
+        "flip_x": lambda i, f: X4KCachedGT._flip_x(i, f),
+        "flip_y": lambda i, f: X4KCachedGT._flip_y(i, f),
+        "rot90 ccw": lambda i, f: X4KCachedGT._rot(i, f, 1),
+        "rot180": lambda i, f: X4KCachedGT._rot(i, f, 2),
+        "rot90 cw": lambda i, f: X4KCachedGT._rot(i, f, 3),
+    }
+    for name, transform in cases.items():
+        images, flows = transform([ids.copy()], [flow.copy()])
+        moved = np.ascontiguousarray(images[0])[:, :, 0]
+        out = flows[0]
+        pos = np.zeros((size * size, 2), dtype=np.int64)
+        rows, cols = np.mgrid[0:moved.shape[0], 0:moved.shape[1]]
+        pos[moved.ravel(), 0] = rows.ravel()
+        pos[moved.ravel(), 1] = cols.ravel()
+
+        checked = wrong = 0
+        for r in range(size):
+            for c in range(size):
+                du, dv = int(flow[0, r, c]), int(flow[1, r, c])
+                r2, c2 = r + dv, c + du
+                if not (0 <= r2 < size and 0 <= c2 < size):
+                    continue  # T(p + d) is undefined off the lattice
+                here, there = pos[r * size + c], pos[r2 * size + c2]
+                checked += 1
+                if (out[0, here[0], here[1]] != there[1] - here[1]
+                        or out[1, here[0], here[1]] != there[0] - here[0]):
+                    wrong += 1
+        check(f"[{name}] flow transforms with the pixels", wrong == 0,
+              f"{checked} vectors, {wrong} wrong")
+
+    # Two reflections compose into a rotation; if either were wrong on
+    # its own this would still have to fail.
+    left = X4KCachedGT._flip_y(*X4KCachedGT._flip_x([ids.copy()], [flow.copy()]))
+    right = X4KCachedGT._rot([ids.copy()], [flow.copy()], 2)
+    check(
+        "flip_x . flip_y == rot180",
+        np.array_equal(np.ascontiguousarray(left[0][0]),
+                       np.ascontiguousarray(right[0][0]))
+        and np.allclose(left[1][0], right[1][0]),
+    )
+
+
 def test_occlusion_gate():
     print("\n5. Occlusion gate and Phase 1 signals")
     net = CoeffNet(channels=16)
@@ -716,6 +784,7 @@ def main():
     test_occlusion_gate()
     test_residual_bound()
     test_configs_match_schema()
+    test_flow_augmentation()
     test_rgb_branch_switch()
     test_splat()
     test_splat_backends()

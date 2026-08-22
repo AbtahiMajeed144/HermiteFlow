@@ -17,7 +17,16 @@
 trainer: stage_inr
 
 dataset:
+  # x4k_multi_t  runs the frozen teacher online, 2*K RAFT passes/step.
+  # x4k_cached   reads them from scripts/generate_offline_gt.py instead,
+  #              which removes ~900 ms of a ~1.19 s step. Flip the type
+  #              and point cache_path at the output directory; everything
+  #              else below still applies, including `repeat`, which the
+  #              cached loader honours at read time (the cache holds one
+  #              entry per clip, so without it an epoch would be 138
+  #              steps instead of ~1.1k).
   type: x4k_multi_t
+  cache_path: null
   # Training clips. Points at the mp4 tree; both this and the doubled
   # `encoded_train/encoded_train` resolve, the search is recursive.
   path: ./data/x4k/encoded_train

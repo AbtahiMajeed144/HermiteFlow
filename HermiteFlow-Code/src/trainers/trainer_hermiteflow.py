@@ -116,7 +116,13 @@ class Trainer(TrainerTemplate):
         """
         xs = batch["xs"].to(device, non_blocking=True)  # (B, 3, 2 + K, H, W)
         num_targets = xs.shape[2] - 2
-        assert num_targets >= 1, "each sample needs at least one ground-truth frame"
+        # A cached-teacher batch carries no middle frames at all: their
+        # only consumer in stage 1 is teacher_flows, which has already
+        # run offline. See datasets/x4k_cached.py.
+        cached = "teacher_phi" in batch
+        assert num_targets >= 1 or cached, (
+            "each sample needs a ground-truth frame, or a cached teacher target"
+        )
 
         img_xs = xs[:, :, :2]
         gts = [xs[:, :, 2 + k] for k in range(num_targets)]
@@ -126,15 +132,31 @@ class Trainer(TrainerTemplate):
             if times.ndim == 1:
                 times = times.unsqueeze(1)
         else:
+            assert num_targets >= 1, "no timesteps and no ground-truth frames"
             times = 0.5 * torch.ones(
                 xs.shape[0], num_targets, device=device, dtype=torch.float
             )
 
-        assert times.shape[1] == num_targets, (
+        assert num_targets in (0, times.shape[1]), (
             f"got {num_targets} ground-truth frames but {times.shape[1]} timesteps"
         )
-        t_list = [times[:, k] for k in range(num_targets)]
+        t_list = [times[:, k] for k in range(times.shape[1])]
         return img_xs, gts, t_list
+
+    @staticmethod
+    def cached_teacher(batch, device):
+        """
+        The offline trajectory targets, in the same shape teacher_flows
+        returns: a list of K (f_{0->t}, f_{1->t}) pairs, each (B, 2, H, W).
+
+        Returns None when the batch has no cache, so the caller falls
+        back to running the teacher online.
+        """
+        if "teacher_phi" not in batch:
+            return None
+        phi = batch["teacher_phi"].to(device, non_blocking=True).float()
+        psi = batch["teacher_psi"].to(device, non_blocking=True).float()
+        return [(phi[:, k], psi[:, k]) for k in range(phi.shape[1])]
 
     def image_losses(self, pred, target):
         """Returns (lap, census, l1, lpips) for one prediction/target pair."""
@@ -271,8 +293,8 @@ class Trainer(TrainerTemplate):
         model.eval()
         for _it, batch in pbar:
             img_xs, gts, t_list = self.unpack(batch, self.device)
-            teacher = None
-            if self.stage == 1 or self.flow_distill_weight > 0:
+            teacher = self.cached_teacher(batch, self.device)
+            if teacher is None and (self.stage == 1 or self.flow_distill_weight > 0):
                 teacher = model_module.teacher_flows(
                     img_xs[:, :, 0], img_xs[:, :, 1], gts,
                     iters=self.teacher_raft_iter,
@@ -381,8 +403,8 @@ class Trainer(TrainerTemplate):
             # The privileged teacher runs outside autocast and without
             # grad: it is the frozen estimator applied to the ground-truth
             # middle frames, so it is a target, not part of the graph.
-            teacher = None
-            if self.flow_distill_weight > 0:
+            teacher = self.cached_teacher(batch, self.device)
+            if teacher is None and self.flow_distill_weight > 0:
                 teacher = model_module.teacher_flows(
                     img_xs[:, :, 0],
                     img_xs[:, :, 1],
