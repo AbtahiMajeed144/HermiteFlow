@@ -88,7 +88,26 @@ def augment_dist_defaults(config, distenv):
     total_batch_size = config.experiment.get("total_batch_size", world_batch_size)
 
     if total_batch_size % world_batch_size != 0:
-        raise ValueError("total batch size must be divisible by world batch size")
+        # experiment.batch_size is PER PROCESS, so a config written for
+        # one GPU stops fitting the moment it is launched on two. Say
+        # what the numbers are and what to set - the bare assertion sent
+        # people hunting through the config for a value that was fine.
+        if total_batch_size % distenv.world_size == 0:
+            fix = (
+                f"set experiment.batch_size="
+                f"{total_batch_size // distenv.world_size} to keep the same "
+                f"effective batch of {total_batch_size}"
+            )
+        else:
+            fix = (
+                f"raise experiment.total_batch_size to a multiple of "
+                f"{world_batch_size}"
+            )
+        raise ValueError(
+            f"total_batch_size ({total_batch_size}) must be divisible by the "
+            f"world batch size ({world_batch_size} = batch_size "
+            f"{local_batch_size} x world_size {distenv.world_size}); {fix}"
+        )
     else:
         grad_accm_steps = total_batch_size // world_batch_size
 
