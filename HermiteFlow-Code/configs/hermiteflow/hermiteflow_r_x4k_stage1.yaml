@@ -115,11 +115,16 @@ loss:
   # Trajectory distillation against the frozen estimator run on the
   # ground-truth middle frames. Costs 2*K extra flow passes per step.
   flow_distill_weight: 1.0
-  # The teacher runs 2*K frozen flow passes per step. At raft_iter=20
-  # and K=5 that measured 901 ms against 658 ms for the entire rest of
-  # the step; 12 iterations cuts it to 528 ms and the target is only
-  # needed well enough to break the time-to-location ambiguity.
-  teacher_raft_iter: 12
+  # The teacher runs 2*K frozen flow passes. Online that cost is paid
+  # every step - at raft_iter=20 and K=5 it measured 901 ms against
+  # 658 ms for the entire rest of the step, which is why this was 12.
+  # Offline it is paid ONCE, so the speed argument no longer applies
+  # and the only thing left to optimise is target quality. The
+  # deviation the model has to learn is beta_2(t) * |(t-1) d0 + t d1|,
+  # about 0.04 px at the d ~ 0.25 stage 1 currently reaches, so teacher
+  # error is not a rounding detail - it is comparable to the signal.
+  # Run the cache at 20 and never think about it again.
+  teacher_raft_iter: 20
 
 optimizer:
   type: adamw
