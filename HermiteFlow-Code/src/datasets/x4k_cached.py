@@ -272,13 +272,21 @@ class X4KCachedGT(Dataset):
             path = self.samples[index]
             prefix = path[: -len("_flow.npz")]
             with np.load(path) as data:
-                phi_all = data["flow_0_t"].astype(np.float32)  # (Kc, 2, H, W)
-                psi_all = data["flow_1_t"].astype(np.float32)
+                phi_all = data["flow_0_t"]          # (Kc, 2, H, W) float16
+                psi_all = data["flow_1_t"]
                 t_all = data["t"].astype(np.float32)
 
-            keep = self._pick(len(t_all)) if self.if_aug else self._eval_pick(len(t_all))
-            phi = [phi_all[i] for i in keep]
-            psi = [psi_all[i] for i in keep]
+                # Subset BEFORE widening to float32. Converting the whole
+                # grid and then discarding what _pick did not choose was
+                # the dominant cost in this branch - 7.1 ms of a 9.6 ms
+                # sample, nearly all of it the fp16->fp32 expansion of
+                # 3.5 MiB, of which K/Kc is actually used.
+                keep = (
+                    self._pick(len(t_all)) if self.if_aug
+                    else self._eval_pick(len(t_all))
+                )
+                phi = [phi_all[i].astype(np.float32) for i in keep]
+                psi = [psi_all[i].astype(np.float32) for i in keep]
             times = [float(t_all[i]) for i in keep]
 
             # cv2 reads BGR; the cache was written from RGB, reverse back.
