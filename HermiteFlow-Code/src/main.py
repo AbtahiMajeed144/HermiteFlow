@@ -14,6 +14,8 @@ except OSError:
 
 import argparse
 import math
+import os
+import sys
 
 import torch
 import torch.distributed as dist
@@ -97,7 +99,22 @@ def add_dist_arguments(parser):
         "--node_rank", default=-1, type=int, help="node rank for distributed training"
     )
     parser.add_argument("--nnodes", default=-1, type=int)
-    parser.add_argument("--nproc_per_node", default=-1, type=int)
+    parser.add_argument(
+        "--nproc_per_node",
+        default=-1,
+        type=int,
+        help="GPUs to use. Greater than 1 re-launches this script once "
+        "per GPU, so a plain `python src/main.py` drives DDP without "
+        "torchrun; harmless under torchrun, which sets WORLD_SIZE itself",
+    )
+    parser.add_argument(
+        "--master-port",
+        "--master_port",
+        dest="master_port",
+        default=16890,
+        type=int,
+        help="rendezvous port for the self-launched workers",
+    )
     parser.add_argument(
         "--dist-backend", default="nccl", type=str, help="distributed backend"
     )
@@ -117,8 +134,69 @@ def parse_args():
     return args, extra_args
 
 
+def spawn_workers(args):
+    """
+    Re-launch this script once per GPU with the env torchrun would set.
+
+    dist_utils.initialize reads RANK, WORLD_SIZE and LOCAL_RANK and
+    nothing else, so exporting those three is the whole of what torchrun
+    was doing here. Without this, `python src/main.py --nproc_per_node=2`
+    quietly trains on one GPU - the flag was parsed and never used.
+    """
+    import subprocess
+    import time
+
+    env = os.environ.copy()
+    env["WORLD_SIZE"] = str(args.nproc_per_node)
+    env.setdefault("MASTER_ADDR", "127.0.0.1")
+    env.setdefault("MASTER_PORT", str(args.master_port))
+
+    workers = []
+    failure = 1
+    try:
+        for rank in range(args.nproc_per_node):
+            workers.append(subprocess.Popen(
+                [sys.executable] + sys.argv,
+                env={**env, "RANK": str(rank), "LOCAL_RANK": str(rank)},
+            ))
+        while True:
+            codes = [w.poll() for w in workers]
+            # Poll rather than wait() in order: a rank that dies leaves
+            # its peers blocked forever on an all-reduce that will never
+            # arrive, and waiting on rank 0 first would not notice. On a
+            # time-limited session that hang costs the rest of the run.
+            bad = [(i, c) for i, c in enumerate(codes) if c not in (None, 0)]
+            if bad:
+                # Record the real exit code here, before the peers are
+                # terminated below - their signal codes are also non-zero
+                # and would otherwise mask which rank actually failed.
+                rank, failure = bad[0]
+                print(f"[dist] rank {rank} exited with {failure}; "
+                      f"stopping {len(workers) - 1} peer(s)")
+                break
+            if all(c is not None for c in codes):
+                return 0
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        failure = 130
+    finally:
+        for worker in workers:
+            if worker.poll() is None:
+                worker.terminate()
+        for worker in workers:
+            try:
+                worker.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                worker.kill()
+    return failure
+
+
 if __name__ == "__main__":
     args, extra_args = parse_args()
+    # Only the outermost invocation spawns: torchrun and our own workers
+    # both arrive with WORLD_SIZE already in the environment.
+    if args.nproc_per_node > 1 and "WORLD_SIZE" not in os.environ:
+        sys.exit(spawn_workers(args))
     set_seed(args.seed)
     config, logger, writer = setup(args, extra_args)
     distenv = config.runtime.distenv
