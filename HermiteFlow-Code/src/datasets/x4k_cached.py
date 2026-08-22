@@ -55,23 +55,63 @@ class X4KCachedGT(Dataset):
         self.repeat = max(1, int(repeat))
 
         path = os.path.expanduser(path)
-        self.samples = sorted(
-            glob.glob(os.path.join(path, "**", "sample_*_flow.npz"), recursive=True)
-        )
-        if not self.samples:
-            raise FileNotFoundError(
-                f"no cached samples under {path}. Expected "
-                f"split_*/sample_*_flow.npz from scripts/generate_offline_gt.py."
-            )
+        self.root = path
 
-        # Globbing rather than assuming a contiguous range: the generator
-        # drops any sample whose teacher flow came back non-finite, and
-        # several splits may be merged into one directory.
-        self.manifests = [
-            json.load(open(p)) for p in
-            sorted(glob.glob(os.path.join(path, "**", "manifest.json"), recursive=True))
-        ]
+        # Packed layout (scripts/pack_offline_gt.py) if present, else the
+        # per-sample files the generator wrote. The packed arrays are
+        # memory-MAPPED, never loaded: training runs under DDP, so an
+        # explicit load would cost one full copy per rank - 2 x 16.7 GiB
+        # on a 30 GiB box - while the page cache behind a mapping is
+        # shared by every rank and every forked worker.
+        self.packed = os.path.isfile(os.path.join(path, "flows.npy"))
+        self._flows = None      # opened lazily, per worker process
+        self._images = None
+
+        if self.packed:
+            info = json.load(open(os.path.join(path, "packed.json")))
+            self.count = int(info["num_samples"])
+            self.times = np.load(os.path.join(path, "times.npy"))
+            self.manifests = info.get("source_manifests", []) or [
+                {"num_timesteps": int(info["num_timesteps"])}
+            ]
+        else:
+            # Globbing rather than assuming a contiguous range: the
+            # generator drops any sample whose teacher flow came back
+            # non-finite, and several splits may be merged into one dir.
+            self.samples = sorted(
+                glob.glob(os.path.join(path, "**", "sample_*_flow.npz"), recursive=True)
+            )
+            if not self.samples:
+                raise FileNotFoundError(
+                    f"no cached samples under {path}. Expected "
+                    f"split_*/sample_*_flow.npz from generate_offline_gt.py, "
+                    f"or flows.npy from pack_offline_gt.py."
+                )
+            self.count = len(self.samples)
+            self.manifests = [
+                json.load(open(p)) for p in sorted(
+                    glob.glob(os.path.join(path, "**", "manifest.json"), recursive=True)
+                )
+            ]
         self._check(expect)
+
+    def _maps(self):
+        """
+        Open the mappings on first use in whichever process is asking.
+
+        DataLoader workers are forked after __init__, and a memmap opened
+        in the parent is not safely shared across that fork; opening per
+        process costs one mmap syscall and keeps the page cache - which
+        IS shared - doing the actual work.
+        """
+        if self._flows is None:
+            self._flows = np.load(
+                os.path.join(self.root, "flows.npy"), mmap_mode="r"
+            )
+            self._images = np.load(
+                os.path.join(self.root, "images.npy"), mmap_mode="r"
+            )
+        return self._flows, self._images
 
     def _check(self, expect):
         """Fail loudly if the cache was built for a different protocol."""
@@ -102,7 +142,7 @@ class X4KCachedGT(Dataset):
                 )
 
     def __len__(self):
-        return len(self.samples) * self.repeat
+        return self.count * self.repeat
 
     # ------------------------------------------------------------------
     # Timestep selection - mirrors X4KMultiT._grid_steps, anchored at
@@ -208,22 +248,42 @@ class X4KCachedGT(Dataset):
     # ------------------------------------------------------------------
 
     def __getitem__(self, index):
-        path = self.samples[index % len(self.samples)]
-        prefix = path[: -len("_flow.npz")]
+        index %= self.count
 
-        with np.load(path) as data:
-            phi_all = data["flow_0_t"].astype(np.float32)  # (Kc, 2, H, W)
-            psi_all = data["flow_1_t"].astype(np.float32)
-            t_all = data["t"].astype(np.float32)
+        if self.packed:
+            flows, images = self._maps()
+            t_all = self.times[index]
+            keep = self._pick(len(t_all)) if self.if_aug else self._eval_pick(len(t_all))
+            # Index the timesteps inside the mapping so only the pages
+            # for the K kept ones are faulted in - 5 of 7 is a 29%
+            # saving on every read, and the OS caches exactly what gets
+            # used rather than the whole grid.
+            phi = list(flows[index, 0][keep].astype(np.float32))
+            psi = list(flows[index, 1][keep].astype(np.float32))
+            times = [float(t_all[i]) for i in keep]
+            # np.array, not np.asarray: a slice of a read-only mapping is
+            # itself read-only, and handing that straight to
+            # torch.from_numpy makes a tensor that aliases the mapping.
+            # Nothing writes to it today, but a write would be undefined
+            # behaviour against read-only pages. 192 KiB per image.
+            img0 = np.array(images[index, 0])
+            img1 = np.array(images[index, 1])
+        else:
+            path = self.samples[index]
+            prefix = path[: -len("_flow.npz")]
+            with np.load(path) as data:
+                phi_all = data["flow_0_t"].astype(np.float32)  # (Kc, 2, H, W)
+                psi_all = data["flow_1_t"].astype(np.float32)
+                t_all = data["t"].astype(np.float32)
 
-        keep = self._pick(len(t_all)) if self.if_aug else self._eval_pick(len(t_all))
-        phi = [phi_all[i] for i in keep]
-        psi = [psi_all[i] for i in keep]
-        times = [float(t_all[i]) for i in keep]
+            keep = self._pick(len(t_all)) if self.if_aug else self._eval_pick(len(t_all))
+            phi = [phi_all[i] for i in keep]
+            psi = [psi_all[i] for i in keep]
+            times = [float(t_all[i]) for i in keep]
 
-        # cv2 reads BGR; the cache was written from RGB, so reverse back.
-        img0 = cv2.imread(prefix + "_img0.png")[:, :, ::-1]
-        img1 = cv2.imread(prefix + "_img1.png")[:, :, ::-1]
+            # cv2 reads BGR; the cache was written from RGB, reverse back.
+            img0 = cv2.imread(prefix + "_img0.png")[:, :, ::-1]
+            img1 = cv2.imread(prefix + "_img1.png")[:, :, ::-1]
 
         if self.if_aug:
             img0, img1, phi, psi, times = self._augment(img0, img1, phi, psi, times)
