@@ -41,7 +41,10 @@ from models.hermite_vfi.modules.phase1_measure import (  # noqa: E402
     flow_scale,
     forward_backward_error,
 )
-from models.hermite_vfi.modules.phase2_coeffnet import CoeffNet  # noqa: E402
+from models.hermite_vfi.modules.phase2_coeffnet import (  # noqa: E402
+    CoeffNet,
+    GlobalContext,
+)
 from models.hermite_vfi.modules.phase3_evaluate import (  # noqa: E402
     DEGREES,
     coefficients_from_residuals,
@@ -430,6 +433,73 @@ def test_flow_augmentation():
     )
 
 
+def test_global_context():
+    print(chr(10) + "5e. Global-attention bottleneck (GlobalContext)")
+    args = (
+        torch.rand(1, 3, 32, 32), torch.rand(1, 3, 32, 32),
+        torch.randn(1, 2, 32, 32), torch.randn(1, 2, 32, 32),
+        torch.rand(1, 1, 32, 32), torch.full((1, 1, 1, 1), 20.0),
+    )
+
+    # Zero-initialised output projections: turning the block on must not
+    # move the output AT ALL until training does, same guarantee as the
+    # residual heads.
+    torch.manual_seed(0)
+    off = CoeffNet(channels=8, use_global_context=False)
+    torch.manual_seed(0)
+    on = CoeffNet(channels=8, use_global_context=True)
+    with torch.no_grad():
+        out_off = off(*args)
+        out_on = on(*args)
+    check(
+        "identical output to the block being absent, at init",
+        all((a - b).abs().max().item() < TOL for a, b in zip(out_off, out_on)),
+    )
+
+    # Break the zero-init symmetry, then check the thing the block is
+    # FOR: a genuine, structural path from any location to any other,
+    # not a receptive-field argument. An OUTPUT-PERTURBATION comparison
+    # against the conv trunk turns out not to isolate this cleanly -
+    # GroupNorm normalises over the WHOLE feature map, so even a
+    # conv-only trunk shows a small, noisy, non-vanishing response to a
+    # corner perturbation regardless of distance (confirmed: it does
+    # not go to zero even at 1024px separation, since GroupNorm's
+    # mean/var are shared by every location). That is a real coupling,
+    # just a different KIND - one shared scalar per channel-group,
+    # not a routed, position-specific one - so "reach" alone cannot
+    # tell the two apart; testing the block in isolation and via
+    # autograd can. If the output at one corner has any gradient at
+    # all with respect to the input at the opposite corner, a path
+    # exists through the attention, independent of distance or of how
+    # large a perturbation happens to be.
+    torch.manual_seed(2)
+    block = GlobalContext(channels=16, pooled_size=4, heads=2)
+    torch.nn.init.normal_(block.to_out.weight, std=0.5)
+    torch.nn.init.normal_(block.mlp[-1].weight, std=0.5)
+    h, w = 40, 40
+    x = torch.randn(1, 16, h, w, requires_grad=True)
+    out = block(x)
+    out[:, :, 0, 0].sum().backward()
+    far_grad = x.grad[:, :, -1, -1].abs().sum().item()
+    check(
+        "output at one corner has nonzero gradient w.r.t. the OPPOSITE corner",
+        far_grad > 0, f"|d(out[0,0])/d(x[-1,-1])| = {far_grad:.2e}",
+    )
+
+    # Cost claim: the pooled K/V token count - what makes this tractable
+    # at a 4K eval resolution - must stay fixed as the input grows, not
+    # scale with it the way plain self-attention would.
+    block = GlobalContext(channels=8, pooled_size=8, heads=2)
+    for h, w in ((16, 16), (64, 48)):
+        with torch.no_grad():
+            block(torch.randn(1, 8, h, w))
+        pooled = block.pool(torch.randn(1, 8, h, w))
+        check(
+            f"pooled K/V is fixed at 8x8 regardless of input ({h}x{w})",
+            tuple(pooled.shape[-2:]) == (8, 8), f"got {tuple(pooled.shape[-2:])}",
+        )
+
+
 def test_occlusion_gate():
     print("\n5. Occlusion gate and Phase 1 signals")
     net = CoeffNet(channels=16)
@@ -740,35 +810,48 @@ def test_degree_end_to_end():
 def test_no_unused_parameters():
     """
     DDP runs with find_unused_parameters=False, which is a hard error if
-    any trainable parameter misses a gradient. The two configurations
-    that can produce one are the ablations: an unused quartic head, and
-    an RGB branch that has been switched off.
+    any trainable parameter is skipped by autograd - i.e. p.grad stays
+    None because a Python conditional never used it in the forward pass.
+    That is NOT the same thing as a gradient that legitimately computes
+    to exactly zero: a parameter can be zero-initialised, downstream of
+    ANOTHER zero-initialised layer, and still be a real graph node that
+    DDP is completely happy with. GlobalContext is exactly this - its
+    output projection is zero-init, same as the heads, so on the very
+    first step gradient into everything upstream of it evaluates to
+    zero numerically without ever being None. Checking "grad is None"
+    rather than "grad is zero" is what tells those two apart; the
+    configurations that can produce a genuine None are the ablations -
+    an unused quartic head, an RGB branch switched off.
     """
     print("\n14. No trainable parameter is left unused (DDP safety)")
     img_xs = torch.rand(1, 3, 2, 64, 64)
     times = [torch.tensor([0.3]), torch.tensor([0.7])]
 
+    def run_and_check(label, config):
+        model = _StubFlowModel(config)
+        model.train()
+        sum(p.mean() for p in model(img_xs, t=times)["imgt_pred"]).backward()
+
+        starved = [
+            n for n, p in model.named_parameters()
+            if p.requires_grad and p.grad is None
+        ]
+        check(f"[{label}] every trainable parameter is reached by autograd",
+              len(starved) == 0,
+              f"starved: {starved[:2]}" if starved else "")
+
     for degree in DEGREES:
         for use_rgb in (True, False):
-            model = _StubFlowModel(_config(degree=degree, use_rgb_branch=use_rgb))
-            model.train()
-            # One step first, so the zero-init heads stop masking the rest.
-            opt = torch.optim.AdamW(
-                [p for p in model.parameters() if p.requires_grad], lr=1e-3
+            run_and_check(
+                f"degree={degree}, rgb={'on' if use_rgb else 'off'}",
+                _config(degree=degree, use_rgb_branch=use_rgb),
             )
-            sum(p.mean() for p in model(img_xs, t=times)["imgt_pred"]).backward()
-            opt.step()
-            opt.zero_grad(set_to_none=True)
-            sum(p.mean() for p in model(img_xs, t=times)["imgt_pred"]).backward()
 
-            starved = [
-                n for n, p in model.named_parameters()
-                if p.requires_grad and (p.grad is None or p.grad.abs().sum().item() == 0)
-            ]
-            label = f"degree={degree}, rgb={'on' if use_rgb else 'off'}"
-            check(f"[{label}] every trainable parameter receives gradient",
-                  len(starved) == 0,
-                  f"starved: {starved[:2]}" if starved else "")
+    for use_rgb in (True, False):
+        run_and_check(
+            f"global_context=on, rgb={'on' if use_rgb else 'off'}",
+            _config(use_rgb_branch=use_rgb, use_global_context=True),
+        )
 
 
 def main():
@@ -785,6 +868,7 @@ def main():
     test_residual_bound()
     test_configs_match_schema()
     test_flow_augmentation()
+    test_global_context()
     test_rgb_branch_switch()
     test_splat()
     test_splat_backends()

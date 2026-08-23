@@ -56,6 +56,25 @@ class HermiteFlowConfig:
     # any real solution: distortion is 7.5e-06 at the |d| training
     # currently reaches. It binds only when a run is already diverging.
     residual_bound: float = 2.0
+    # Optional third downsample in CoeffNet, bottleneck at H/8 instead
+    # of H/4. Off by default - costs ~1.6M params on a network whose
+    # count is already the awkward number next to GIMM's 0.25M motion
+    # module, and the case for it (object-scale context at a fast
+    # object) is speculation, not measurement. Turn on only if
+    # large-displacement benchmarks underperform.
+    coeff_net_deep: bool = False
+    # Linear-cost global attention at the CoeffNet bottleneck: every
+    # location cross-attends to a FIXED T x T pool of the whole feature
+    # map (see GlobalContext in phase2_coeffnet.py), rather than to
+    # every other location - plain pixel self-attention is quadratic
+    # in token count, and this model is evaluated at 2K/4K while it
+    # trains at 256x256, where a quadratic cost is not slow, it does
+    # not run. Zero-initialised, so it is the identity until training
+    # moves it - off by default until it has been A/B'd against a
+    # checkpoint that did not have it.
+    use_global_context: bool = False
+    global_context_tokens: int = 8
+    global_context_heads: int = 4
 
     # ---- Training stage ----
     # Mirrors GIMM-VFI's two-stage recipe (paper Tab. 5, repo

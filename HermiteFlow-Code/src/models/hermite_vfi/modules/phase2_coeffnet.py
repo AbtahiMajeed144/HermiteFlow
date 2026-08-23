@@ -115,6 +115,120 @@ class _Branch(nn.Module):
         return self.gain * self.layers(x)
 
 
+class GlobalContext(nn.Module):
+    """
+    Linear-cost global attention at the bottleneck: every location
+    cross-attends to a FIXED-SIZE pool of the whole feature map, rather
+    than to every other location (plain self-attention).
+
+    Why pooled cross-attention and not a Swin/window transformer or a
+    plain ViT bottleneck. Two things a local convolution cannot give by
+    construction, regardless of depth or channel count:
+
+      - occlusion reasoning that needs evidence from elsewhere in the
+        frame, not just a bigger local window
+      - a global cue (camera pan/zoom) that should set a shared
+        curvature prior everywhere at once, cheaper to read from one
+        summary of the whole image than to propagate through conv
+        layers one receptive field at a time
+
+    But this model is evaluated at 2K and 4K (src/X4K.py ds_factor
+    0.5/0.25) while it TRAINS at 256x256 crops. Plain pixel-to-pixel
+    self-attention is quadratic in token count - at a 4K bottleneck
+    that is not slow, it does not run (~10^11 pairs). Pooling the
+    keys/values to a fixed T x T grid, independent of H and W, keeps
+    this block's cost LINEAR in pixel count - same asymptotic class as
+    the convolutions around it - so it does not fall over exactly where
+    the model is scored.
+
+    Position is sinusoidal, computed from normalised coordinates rather
+    than a learned per-cell embedding, for the same reason: a learned
+    embedding is tied to the grid size it was trained at and has
+    nothing to say about a 4K input it never saw.
+
+    Zero-initialised output projections on both the attention and the
+    MLP sub-block: the whole thing starts as the exact identity, for
+    the same reason the residual heads are zero-init. Turning this on
+    changes nothing until training moves it.
+    """
+
+    def __init__(self, channels, pooled_size=8, heads=4, mlp_ratio=2):
+        super().__init__()
+        assert channels % heads == 0, "channels must divide evenly across heads"
+        self.heads = heads
+        self.pooled_size = pooled_size
+        self.pool = nn.AdaptiveAvgPool2d(pooled_size)
+
+        self.norm_q = nn.GroupNorm(8, channels)
+        self.norm_kv = nn.GroupNorm(8, channels)
+        self.to_q = nn.Conv2d(channels, channels, 1)
+        self.to_kv = nn.Conv2d(channels, channels * 2, 1)
+        self.to_out = nn.Conv2d(channels, channels, 1)
+
+        self.norm_mlp = nn.GroupNorm(8, channels)
+        hidden = channels * mlp_ratio
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, 1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 1),
+        )
+
+        nn.init.zeros_(self.to_out.weight)
+        nn.init.zeros_(self.to_out.bias)
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    @staticmethod
+    def _position(h, w, channels, device, dtype):
+        """Sinusoidal 2D position from coordinates in [-1, 1] - defined
+        identically at any (h, w), so there is no learned embedding to
+        run out of range at an eval resolution far from training."""
+        quarter = channels // 4
+        y = torch.linspace(-1, 1, h, device=device, dtype=dtype)
+        x = torch.linspace(-1, 1, w, device=device, dtype=dtype)
+        omega = torch.arange(quarter, device=device, dtype=dtype)
+        omega = 1.0 / (10000 ** (omega / max(quarter, 1)))
+        y_enc = y[:, None] * omega[None, :]  # (h, c/4)
+        x_enc = x[:, None] * omega[None, :]  # (w, c/4)
+        pe = torch.cat(
+            [
+                torch.sin(y_enc)[:, None, :].expand(h, w, quarter),
+                torch.cos(y_enc)[:, None, :].expand(h, w, quarter),
+                torch.sin(x_enc)[None, :, :].expand(h, w, quarter),
+                torch.cos(x_enc)[None, :, :].expand(h, w, quarter),
+            ],
+            dim=-1,
+        )  # (h, w, c)
+        return pe.permute(2, 0, 1).unsqueeze(0)  # (1, c, h, w)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        head_dim = c // self.heads
+        t2 = self.pooled_size * self.pooled_size
+
+        pos_full = self._position(h, w, c, x.device, x.dtype)
+        pos_pool = self._position(
+            self.pooled_size, self.pooled_size, c, x.device, x.dtype
+        )
+
+        q = self.to_q(self.norm_q(x) + pos_full).flatten(2)  # (B, C, HW)
+        pooled = self.pool(x)
+        k, v = self.to_kv(self.norm_kv(pooled) + pos_pool).flatten(2).chunk(2, dim=1)
+
+        q = q.view(b, self.heads, head_dim, h * w)
+        k = k.view(b, self.heads, head_dim, t2)
+        v = v.view(b, self.heads, head_dim, t2)
+
+        attn = torch.softmax(
+            torch.einsum("bhdq,bhdk->bhqk", q, k) / (head_dim ** 0.5), dim=-1
+        )
+        out = torch.einsum("bhqk,bhdk->bhdq", attn, v).reshape(b, c, h, w)
+
+        x = x + self.to_out(out)
+        x = x + self.mlp(self.norm_mlp(x))
+        return x
+
+
 class CoeffNet(nn.Module):
     """
     Predicts the velocity residuals d0, d1 (and, for the quartic
@@ -157,12 +271,16 @@ class CoeffNet(nn.Module):
         num_residuals=2,
         deep=False,
         residual_bound=2.0,
+        use_global_context=False,
+        global_context_tokens=8,
+        global_context_heads=4,
     ):
         super().__init__()
         self.use_rgb_branch = use_rgb_branch
         self.num_residuals = num_residuals
         self.deep = deep
         self.residual_bound = float(residual_bound)
+        self.use_global_context = bool(use_global_context)
 
         c1, c2, c3 = channels, channels * 2, channels * 4
 
@@ -205,6 +323,15 @@ class CoeffNet(nn.Module):
                 nn.LeakyReLU(0.1, inplace=True),
                 LateralBlock(c3),
             )
+
+        # Always constructed, for the same reason as rgb_branch: a
+        # checkpoint trained with this on can be evaluated with it off
+        # and vice versa, so any future ablation is a runtime switch
+        # rather than a different set of weights.
+        self.global_context = GlobalContext(
+            c3, pooled_size=global_context_tokens, heads=global_context_heads
+        )
+        self.set_global_context(use_global_context)
 
         self.up1 = nn.Sequential(
             nn.Conv2d(c3 + c2, c2, 3, 1, 1),
@@ -253,6 +380,13 @@ class CoeffNet(nn.Module):
         self.use_rgb_branch = bool(enabled)
         for param in self.rgb_branch.parameters():
             param.requires_grad = self.use_rgb_branch
+
+    def set_global_context(self, enabled):
+        """Runtime switch for the global-attention block. Same DDP/AdamW
+        reasoning as set_rgb_branch: rebuild the optimizer after calling."""
+        self.use_global_context = bool(enabled)
+        for param in self.global_context.parameters():
+            param.requires_grad = self.use_global_context
 
     def set_active_heads(self, num_used):
         """
@@ -353,6 +487,9 @@ class CoeffNet(nn.Module):
                 f4, size=f3.shape[-2:], mode="bilinear", align_corners=False
             )
             f3 = self.up0(torch.cat([u0, f3], dim=1))
+
+        if self.use_global_context:
+            f3 = self.global_context(f3)
 
         u1 = F.interpolate(f3, size=f2.shape[-2:], mode="bilinear", align_corners=False)
         u1 = self.up1(torch.cat([u1, f2], dim=1))

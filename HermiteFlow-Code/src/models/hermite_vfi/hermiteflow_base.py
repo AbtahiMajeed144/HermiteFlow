@@ -91,6 +91,10 @@ class HermiteFlowBase(nn.Module):
             use_rgb_branch=config.use_rgb_branch,
             num_residuals=max(RESIDUALS_PER_DEGREE.values()),
             residual_bound=config.residual_bound,
+            deep=config.coeff_net_deep,
+            use_global_context=config.use_global_context,
+            global_context_tokens=config.global_context_tokens,
+            global_context_heads=config.global_context_heads,
         )
         # Heads the configured degree does not consume are frozen and not
         # evaluated: an unused parameter is a hard error under DDP with
