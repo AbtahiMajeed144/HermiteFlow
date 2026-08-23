@@ -45,6 +45,12 @@ from models.hermite_vfi.modules.phase2_coeffnet import (  # noqa: E402
     CoeffNet,
     GlobalContext,
 )
+from models.hermite_vfi.modules.phase2_coeffnet_transformer import (  # noqa: E402
+    SwinBlock,
+    TransformerCoeffNet,
+    window_partition,
+    window_reverse,
+)
 from models.hermite_vfi.modules.phase3_evaluate import (  # noqa: E402
     DEGREES,
     coefficients_from_residuals,
@@ -500,6 +506,127 @@ def test_global_context():
         )
 
 
+def test_transformer_coeffnet():
+    print(chr(10) + "5f. Pure-transformer CoeffNet (TransformerCoeffNet)")
+    # Encoder AND decoder are window attention, not convolution - see
+    # phase2_coeffnet_transformer.py. Two things a from-scratch
+    # reimplementation of a whole trunk can get wrong silently: the
+    # window partition/reverse bookkeeping (shape bugs), and the
+    # shifted-window mask (a wrong mask still LOOKS locally sane -
+    # windows attend to something plausible - while quietly reading
+    # from the wrong side of the image via the cyclic-shift wraparound).
+
+    for b, c, h, w, ws in [(1, 4, 16, 16, 8), (2, 8, 24, 32, 8), (1, 4, 8, 8, 8)]:
+        x = torch.randn(b, c, h, w)
+        back = window_reverse(window_partition(x, ws), ws, h, w, b)
+        check(f"window partition/reverse round trip [{h}x{w}, ws={ws}]",
+              torch.allclose(x, back))
+
+    for h, w in [(17, 23), (5, 5), (33, 8)]:
+        block = SwinBlock(dim=8, window_size=8, heads=2, shift=True)
+        with torch.no_grad():
+            y = block(torch.randn(1, 8, h, w))
+        check(f"SwinBlock preserves shape at a non-multiple-of-window size {h}x{w}",
+              tuple(y.shape) == (1, 8, h, w))
+
+    # Ground truth below was read off the actual gradient map, not
+    # hand-derived: the mask's region labels live in POST-ROLL
+    # coordinates, and translating that back to pre-roll pixel
+    # positions by hand is exactly the kind of arithmetic this test
+    # exists to not have to trust (an earlier draft of this test picked
+    # the wrong "wrap-around" pair by doing exactly that).
+    def reach(block, qr, qc, seed=0):
+        torch.manual_seed(seed)
+        torch.nn.init.normal_(block.attn.proj.weight, std=0.5)
+        torch.nn.init.normal_(block.mlp[-1].weight, std=0.5)
+        x = torch.randn(1, 4, 8, 8, requires_grad=True)
+        block(x)[:, :, qr, qc].sum().backward()
+        return x.grad.abs().sum(dim=1)[0] > 1e-9  # (8, 8) bool
+
+    # window_size=4, image 8x8: an UNSHIFTED block's own window ends at
+    # row/col 4, so a query at its last row/col (3, 3) must never reach
+    # past it - plain window locality, no mask involved.
+    r = reach(SwinBlock(dim=4, window_size=4, heads=1, shift=False), 3, 3)
+    check("unshifted block: query (3,3) never reaches row or col >= 4",
+          not r[4:, :].any().item() and not r[:, 4:].any().item())
+
+    # The SAME query on a SHIFTED block must now cross that edge - the
+    # entire reason to shift is to connect what the line above shows a
+    # plain window structurally cannot.
+    r = reach(SwinBlock(dim=4, window_size=4, heads=1, shift=True), 3, 3)
+    check("shifted block: query (3,3) DOES cross the boundary",
+          r[4:, :].any().item() or r[:, 4:].any().item())
+
+    # (0,0) and (7,7) land in the SAME post-roll window (opposite image
+    # corners, glued by the cyclic wrap) but come from different
+    # original regions - the mask must zero that pair. (0,0) and (1,1)
+    # land in the same window AND the same original region - a genuine
+    # connection the mask must not remove.
+    r = reach(SwinBlock(dim=4, window_size=4, heads=1, shift=True), 0, 0)
+    check("wrap-glued pair (query (0,0), input (7,7)) is masked to zero",
+          not r[7, 7].item())
+    check("genuine same-region pair (query (0,0), input (1,1)) stays connected",
+          r[1, 1].item())
+
+    args = (
+        torch.rand(1, 3, 40, 40), torch.rand(1, 3, 40, 40),
+        torch.randn(1, 2, 40, 40), torch.randn(1, 2, 40, 40),
+        torch.rand(1, 1, 40, 40), torch.full((1, 1, 1, 1), 20.0),
+    )
+    torch.manual_seed(0)
+    net = TransformerCoeffNet(channels=8, window_size=8)
+    with torch.no_grad():
+        out = net(*args)
+    check("zero-init heads -> exact linear baseline at init, same as CoeffNet",
+          all(r.abs().max().item() < 1e-6 for r in out))
+    check("output shape matches input spatial size",
+          all(tuple(r.shape) == (1, 2, 40, 40) for r in out))
+
+    net.set_active_heads(1)
+    check("set_active_heads narrows output count", len(net(*args)) == 1)
+    net.set_active_heads(2)
+
+    with torch.no_grad():
+        off_a = net(*args)
+    net.set_rgb_branch(False)
+    for p in net.rgb_stem.parameters():
+        torch.nn.init.normal_(p, std=1.0)
+    with torch.no_grad():
+        off_b = net(*args)
+    check("rgb branch off is a true runtime switch, same as CoeffNet",
+          all(torch.allclose(a, b) for a, b in zip(off_a, off_b)))
+
+    torch.manual_seed(0)
+    net2 = TransformerCoeffNet(channels=8, window_size=8)
+    sum(r.mean() for r in net2(*args)).backward()
+    starved = [n for n, p in net2.named_parameters() if p.requires_grad and p.grad is None]
+    check("every trainable parameter is reached by autograd (DDP safety)",
+          len(starved) == 0, f"skipped: {starved[:2]}" if starved else "")
+
+    net3 = TransformerCoeffNet(channels=8, window_size=8, residual_bound=2.0)
+    for head in net3.heads:
+        torch.nn.init.normal_(head.weight, std=5.0)
+        torch.nn.init.normal_(head.bias, std=50.0)
+    with torch.no_grad():
+        blown = net3(*args)
+    cap = 2.0 * args[-1].max().item()
+    check("residual_bound cap still enforced (same fix, carried over verbatim)",
+          max(r.abs().max().item() for r in blown) <= cap + 1e-4)
+
+    torch.manual_seed(0)
+    net4 = TransformerCoeffNet(channels=8, window_size=8)
+    for size in (48, 96):
+        a = (
+            torch.rand(1, 3, size, size), torch.rand(1, 3, size, size),
+            torch.randn(1, 2, size, size), torch.randn(1, 2, size, size),
+            torch.rand(1, 1, size, size), torch.full((1, 1, 1, 1), 20.0),
+        )
+        with torch.no_grad():
+            out = net4(*a)
+        check(f"same module runs at {size}x{size} without reshaping anything",
+              all(tuple(r.shape) == (1, 2, size, size) for r in out))
+
+
 def test_occlusion_gate():
     print("\n5. Occlusion gate and Phase 1 signals")
     net = CoeffNet(channels=16)
@@ -869,6 +996,7 @@ def main():
     test_configs_match_schema()
     test_flow_augmentation()
     test_global_context()
+    test_transformer_coeffnet()
     test_rgb_branch_switch()
     test_splat()
     test_splat_backends()

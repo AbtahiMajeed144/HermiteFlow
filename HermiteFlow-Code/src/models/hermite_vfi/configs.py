@@ -75,6 +75,21 @@ class HermiteFlowConfig:
     use_global_context: bool = False
     global_context_tokens: int = 8
     global_context_heads: int = 4
+    # "cnn"         CoeffNet: the U-Net above, GlobalContext optional.
+    # "transformer" TransformerCoeffNet: encoder AND decoder are window
+    #               attention (Swin-style), not convolution - see
+    #               phase2_coeffnet_transformer.py. use_rgb_branch,
+    #               residual_bound and use_global_context (the pooled
+    #               bottleneck block) all still apply; coeff_net_deep
+    #               does not, this backbone has no such switch.
+    coeff_net_backbone: str = "cnn"
+    # Window size for the transformer backbone, in pixels of THAT
+    # stage's own resolution (so it covers more of the original image
+    # at deeper, already-downsampled stages, same as a conv's receptive
+    # field naturally growing with depth). Cost is linear in image area
+    # regardless of this value - the same 8 used everywhere else in
+    # this file as "a coarse but meaningful spatial granularity".
+    transformer_window_size: int = 8
 
     # ---- Training stage ----
     # Mirrors GIMM-VFI's two-stage recipe (paper Tab. 5, repo

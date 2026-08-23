@@ -39,6 +39,7 @@ from .modules.phase1_measure import (
     forward_backward_error,
 )
 from .modules.phase2_coeffnet import CoeffNet, run_both_sides
+from .modules.phase2_coeffnet_transformer import TransformerCoeffNet
 from .modules.phase3_evaluate import (
     RESIDUALS_PER_DEGREE,
     coefficients_from_residuals,
@@ -83,19 +84,31 @@ class HermiteFlowBase(nn.Module):
         # ===== Phase 2: endpoint velocities =====
         # The head count is fixed by the widest degree so that a single
         # checkpoint serves every entry in the degree ablation - only the
-        # basis conversion in Phase 3 changes.
-        self.coeff_net = CoeffNet(
+        # basis conversion in Phase 3 changes. Both backbones share this
+        # contract (forward signature, set_rgb_branch, set_active_heads,
+        # .gate, .residual_bound) - see TransformerCoeffNet's docstring.
+        backbone = getattr(config, "coeff_net_backbone", "cnn")
+        common = dict(
             channels=config.coeff_net_channels,
             gate_init_bias=config.gate_init_bias,
             gate_init_scale=config.gate_init_scale,
             use_rgb_branch=config.use_rgb_branch,
             num_residuals=max(RESIDUALS_PER_DEGREE.values()),
             residual_bound=config.residual_bound,
-            deep=config.coeff_net_deep,
             use_global_context=config.use_global_context,
             global_context_tokens=config.global_context_tokens,
             global_context_heads=config.global_context_heads,
         )
+        if backbone == "cnn":
+            self.coeff_net = CoeffNet(deep=config.coeff_net_deep, **common)
+        elif backbone == "transformer":
+            self.coeff_net = TransformerCoeffNet(
+                window_size=config.transformer_window_size, **common
+            )
+        else:
+            raise ValueError(
+                f"arch.coeff_net_backbone must be 'cnn' or 'transformer', got {backbone!r}"
+            )
         # Heads the configured degree does not consume are frozen and not
         # evaluated: an unused parameter is a hard error under DDP with
         # find_unused_parameters=False.
