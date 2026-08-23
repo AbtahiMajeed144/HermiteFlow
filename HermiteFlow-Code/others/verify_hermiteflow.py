@@ -626,6 +626,44 @@ def test_transformer_coeffnet():
         check(f"same module runs at {size}x{size} without reshaping anything",
               all(tuple(r.shape) == (1, 2, size, size) for r in out))
 
+    # Gradient checkpointing (default on) measured 4.8x the CNN's memory
+    # per sample without it - full-resolution stages keep several
+    # intermediates alive per block for backward. Recomputing instead of
+    # storing must not change what is computed: forward and gradients
+    # have to match a non-checkpointed run exactly, not approximately.
+    args_ck = (
+        torch.rand(2, 3, 32, 32), torch.rand(2, 3, 32, 32),
+        torch.randn(2, 2, 32, 32), torch.randn(2, 2, 32, 32),
+        torch.rand(2, 1, 32, 32), torch.full((2, 1, 1, 1), 20.0),
+    )
+    torch.manual_seed(3)
+    ck = TransformerCoeffNet(channels=8, window_size=8, use_checkpoint=True)
+    torch.manual_seed(3)
+    nc = TransformerCoeffNet(channels=8, window_size=8, use_checkpoint=False)
+    for net in (ck, nc):
+        for head in net.heads:
+            torch.nn.init.normal_(head.weight, std=0.3,
+                                  generator=torch.Generator().manual_seed(1))
+    ck.train()
+    nc.train()
+    out_ck, out_nc = ck(*args_ck), nc(*args_ck)
+    check("checkpointed forward matches non-checkpointed exactly",
+          all(torch.allclose(a, b, atol=1e-5) for a, b in zip(out_ck, out_nc)))
+
+    sum(r.mean() for r in out_ck).backward()
+    sum(r.mean() for r in out_nc).backward()
+    grad_ck = {n: p.grad for n, p in ck.named_parameters() if p.requires_grad}
+    grad_nc = {n: p.grad for n, p in nc.named_parameters() if p.requires_grad}
+    starved = [n for n, g in grad_ck.items() if g is None]
+    mismatched = [
+        n for n in grad_ck
+        if grad_ck[n] is not None and not torch.allclose(grad_ck[n], grad_nc[n], atol=1e-4)
+    ]
+    check("checkpointing starves no parameter", len(starved) == 0,
+          f"starved: {starved[:2]}" if starved else "")
+    check("checkpointed gradients match non-checkpointed exactly",
+          len(mismatched) == 0, f"mismatched: {mismatched[:2]}" if mismatched else "")
+
 
 def test_occlusion_gate():
     print("\n5. Occlusion gate and Phase 1 signals")

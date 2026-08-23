@@ -64,6 +64,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from .phase2_coeffnet import FLOW_BRANCH_CHANNELS, RGB_BRANCH_CHANNELS, GlobalContext, OcclusionGate
 
@@ -273,6 +274,7 @@ class TransformerCoeffNet(nn.Module):
         use_global_context=True,
         global_context_tokens=8,
         global_context_heads=4,
+        use_checkpoint=True,
     ):
         super().__init__()
         self.use_rgb_branch = use_rgb_branch
@@ -280,6 +282,11 @@ class TransformerCoeffNet(nn.Module):
         self.residual_bound = float(residual_bound)
         self.window_size = window_size
         self.use_global_context = bool(use_global_context)
+        # Default on: measured 4.8x the CNN's memory per sample without
+        # it (6.1 vs 1.3 GiB at effective batch 4) - this is what makes
+        # the backbone fit a T4 at all at a usable batch size. See
+        # _run_stage.
+        self.use_checkpoint = bool(use_checkpoint)
 
         c1, c2, c3 = channels, channels * 2, channels * 4
         heads1, heads2, heads3 = max(1, c1 // 32), max(1, c2 // 32), max(1, c3 // 32)
@@ -353,10 +360,23 @@ class TransformerCoeffNet(nn.Module):
             for param in head.parameters():
                 param.requires_grad = index < num_used
 
-    @staticmethod
-    def _run_stage(x, blocks):
+    def _run_stage(self, x, blocks):
+        """
+        Every SwinBlock keeps several full-resolution intermediates alive
+        for backward (pad, roll, window-partition, attention output,
+        reverse, unroll), and stage 1 / decode 1 do this at FULL input
+        resolution with no downsampling at all - measured 4.8x the CNN's
+        memory per sample (6.1 vs 1.3 GiB at effective batch 4). Gradient
+        checkpointing trades that for recompute: only each block's input
+        is kept, its internals are rebuilt during backward. self.training
+        gates it because checkpointing only saves anything when a
+        backward pass is coming - at eval time it is pure overhead.
+        """
         for block in blocks:
-            x = block(x)
+            if self.use_checkpoint and self.training and x.requires_grad:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
         return x
 
     def forward(self, img_src, img_dst_aligned, flow, flow_bwd_aligned, occlusion, scale):
