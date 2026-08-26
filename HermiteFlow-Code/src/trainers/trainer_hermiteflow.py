@@ -498,6 +498,25 @@ class Trainer(TrainerTemplate):
                             "non-finite loss at step %d, micro-batch skipped "
                             "(%d so far)", total_step, self.nonfinite_skips
                         )
+                        # Which PART is non-finite, on the rank that logs -
+                        # a bare "non-finite loss" line does not say whether
+                        # it is the (pre-existing) distillation term or the
+                        # (new, v2.1) velocity-consistency term, and the two
+                        # have very different likely causes.
+                        if self.nonfinite_skips <= 3:
+                            detail = {
+                                k: (float(v.detach()) if torch.is_tensor(v) else v)
+                                for k, v in parts.items()
+                            }
+                            logger.warning("  loss parts: %s", detail)
+                            for key in ("m0", "m1", "alpha_fwd", "raft_flow"):
+                                if key in outputs and torch.is_tensor(outputs[key]):
+                                    t = outputs[key]
+                                    logger.warning(
+                                        "  outputs[%s]: finite=%s min=%.4g max=%.4g",
+                                        key, bool(torch.isfinite(t).all()),
+                                        float(t.min()), float(t.max()),
+                                    )
                     optimizer.zero_grad(set_to_none=True)
                     continue
 
