@@ -132,37 +132,58 @@ def blur_descriptor(img, eps=1e-6):
     Returns:
         (B, 3, H, W)
     """
-    device, dtype = img.device, img.dtype
-    luma = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+    # Forced to fp32 regardless of autocast - same reasoning as
+    # forward_splat's fp32 accumulation in phase4_reverse.py, but this
+    # function specifically NEEDS the context-manager form (not just
+    # `.float()`) because it calls F.conv2d, which autocast re-casts to
+    # fp16 on every call REGARDLESS of the input tensor's current dtype.
+    #
+    # Without this: cos(2*theta) and sin(2*theta) are only bounded to
+    # [-1, 1] because disc >= |Jxy| and disc >= |Jxx - Jyy|/2 for the
+    # EXACT same (Jxx, Jxy, Jyy) - a property of one consistent PSD
+    # matrix. Under autocast, Jxx, Jxy and Jyy are each the product of
+    # two INDEPENDENTLY fp16-rounded gradient maps (gx*gx, gx*gy, gy*gy),
+    # so the triple that reaches `disc` is no longer exactly the same
+    # PSD matrix the bound depends on - and the closer a pixel is to
+    # isotropic (disc ~ |Jxy|, the bound's own equality case), the less
+    # rounding it takes to break it. Observed on real (non-i.i.d.-noise)
+    # content: sin(2*theta) up to ~326 instead of <= 1, which overflowed
+    # fp16 in AppNet's very first conv and produced NaN residuals from
+    # step 0 - reproduced and confirmed fixed on a real RAFT checkpoint
+    # before landing this.
+    with torch.autocast(device_type=img.device.type, enabled=False):
+        img = img.float()
+        device, dtype = img.device, img.dtype
+        luma = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
 
-    sobel_x = torch.tensor(
-        [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
-        device=device, dtype=dtype,
-    ).view(1, 1, 3, 3)
-    sobel_y = sobel_x.transpose(-1, -2)
+        sobel_x = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+            device=device, dtype=dtype,
+        ).view(1, 1, 3, 3)
+        sobel_y = sobel_x.transpose(-1, -2)
 
-    luma_pad = F.pad(luma, (1, 1, 1, 1), mode="replicate")
-    gx = F.conv2d(luma_pad, sobel_x)
-    gy = F.conv2d(luma_pad, sobel_y)
+        luma_pad = F.pad(luma, (1, 1, 1, 1), mode="replicate")
+        gx = F.conv2d(luma_pad, sobel_x)
+        gy = F.conv2d(luma_pad, sobel_y)
 
-    jxx, jxy, jyy = gx * gx, gx * gy, gy * gy
+        jxx, jxy, jyy = gx * gx, gx * gy, gy * gy
 
-    kernel = _gaussian_kernel5(device, dtype).view(1, 1, 5, 5).expand(3, 1, 5, 5)
-    j_stack = F.pad(torch.cat([jxx, jxy, jyy], dim=1), (2, 2, 2, 2), mode="replicate")
-    jxx, jxy, jyy = torch.chunk(F.conv2d(j_stack, kernel, groups=3), 3, dim=1)
+        kernel = _gaussian_kernel5(device, dtype).view(1, 1, 5, 5).repeat(3, 1, 1, 1)
+        j_stack = F.pad(torch.cat([jxx, jxy, jyy], dim=1), (2, 2, 2, 2), mode="replicate")
+        jxx, jxy, jyy = torch.chunk(F.conv2d(j_stack, kernel, groups=3), 3, dim=1)
 
-    # J is a Gaussian-smoothed sum of outer products, hence PSD, so
-    # disc <= (Jxx+Jyy)/2 and lambda2 >= 0 exactly - no clamping needed
-    # for the eigenvalues themselves, only for the ratio below.
-    disc = torch.sqrt(((jxx - jyy) * 0.5) ** 2 + jxy * jxy)
-    lambda1 = (jxx + jyy) * 0.5 + disc
-    lambda2 = (jxx + jyy) * 0.5 - disc
+        # J is a Gaussian-smoothed sum of outer products, hence PSD, so
+        # disc <= (Jxx+Jyy)/2 and lambda2 >= 0 exactly - no clamping
+        # needed for the eigenvalues themselves, only for the ratio below.
+        disc = torch.sqrt(((jxx - jyy) * 0.5) ** 2 + jxy * jxy)
+        lambda1 = (jxx + jyy) * 0.5 + disc
+        lambda2 = (jxx + jyy) * 0.5 - disc
 
-    anisotropy = (lambda1 / (lambda2 + eps)).clamp(max=50.0)
-    cos2theta = (jxx - jyy) / (2.0 * disc + eps)
-    sin2theta = (2.0 * jxy) / (2.0 * disc + eps)
+        anisotropy = (lambda1 / (lambda2 + eps)).clamp(max=50.0)
+        cos2theta = (jxx - jyy) / (2.0 * disc + eps)
+        sin2theta = (2.0 * jxy) / (2.0 * disc + eps)
 
-    return torch.cat([anisotropy, cos2theta, sin2theta], dim=1)
+        return torch.cat([anisotropy, cos2theta, sin2theta], dim=1)
 
 
 def flow_scale(flow_fwd, flow_bwd, min_scale=1.0):

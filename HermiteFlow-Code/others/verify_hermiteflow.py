@@ -981,6 +981,39 @@ def test_blur_descriptor():
     check("blur descriptor is finite everywhere",
           torch.isfinite(b_x).all().item() and torch.isfinite(b_n).all().item())
 
+    # Regression test for a real bug: under CUDA autocast, cos(2*theta)/
+    # sin(2*theta) are only bounded to [-1, 1] because disc >= |Jxy| for
+    # the EXACT same (Jxx, Jxy, Jyy). Autocast independently fp16-rounds
+    # each of Jxx, Jxy, Jyy (from two separately-rounded gradient maps),
+    # which can break that bound - observed on real (non-i.i.d.-noise)
+    # GPU input as sin(2*theta) ~= 326, which overflowed fp16 in AppNet's
+    # first conv and produced NaN residuals from step 0 of real training.
+    # blur_descriptor now forces fp32 regardless of autocast; this check
+    # only exercises the CPU path (no autocast involved there either way)
+    # but pins the bound itself so a future refactor cannot reopen the
+    # fp32-forcing without a test noticing.
+    # i.i.d. noise rarely lands near the bound's own equality case
+    # (disc ~ |Jxy|, close to isotropic) - a smoothed/correlated image,
+    # like real video content, hits it far more often, which is exactly
+    # why this bug reproduced on real X4K frames and not on synthetic
+    # random-noise batches during development.
+    torch.manual_seed(1)
+    noise = torch.rand(4, 3, 112, 112)
+    box = torch.ones(3, 1, 9, 9) / 81.0
+    stress = torch.nn.functional.conv2d(
+        torch.nn.functional.pad(noise, (4, 4, 4, 4), mode="reflect"), box, groups=3
+    ).clamp(0, 1)
+    b_stress = blur_descriptor(stress)
+    check("cos(2*theta) and sin(2*theta) stay within [-1, 1]",
+          b_stress[:, 1:3].abs().max().item() <= 1.0 + 1e-4,
+          f"max |cos/sin 2theta| = {b_stress[:, 1:3].abs().max().item():.4f}")
+    if torch.cuda.is_available():
+        with torch.no_grad(), torch.autocast(device_type="cuda", enabled=True):
+            b_gpu = blur_descriptor(stress.cuda())
+        check("[CUDA autocast] cos(2*theta) and sin(2*theta) stay within [-1, 1]",
+              b_gpu[:, 1:3].abs().max().item() <= 1.0 + 1e-4,
+              f"max |cos/sin 2theta| = {b_gpu[:, 1:3].abs().max().item():.4f}")
+
 
 def test_velocity_consistency_loss():
     print("\n17. Cross-lattice velocity-consistency loss (v2.1 Training §3)")
