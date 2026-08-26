@@ -10,14 +10,19 @@ training loss would tell you about:
      basis conversion A = -2d0 - d1, B = d0 + d1.
   3. A freshly initialised model is exactly the linear baseline.
   4. The degree switch really is linear / quadratic / cubic / quartic.
-  5. The occlusion gate closes where the flow is inconsistent.
-  6. The RGB branch is a pure runtime switch (experiment ①).
+  5. The occlusion gate closes where the flow is inconsistent, and (v2.1)
+     runs post-upsample on full-resolution U.
+  6. The three Phase 2 ablation gates (appearance / context / blur) are
+     pure runtime switches (experiment ①, v2.1 form).
   7. Phase 4 inverts a known displacement field, and splat importance
      resolves collisions in favour of the photometric winner.
   8. The torch and cupy splat backends agree.
   9. RefineNet and SynthNet start at their documented neutral points.
  10. One curve per clip: the K flow estimates share one (A, B).
  11. Gradients reach every trainable parameter of every phase.
+ 12. ConvexUp reuses RAFT's own upsample formula exactly.
+ 13. The blur descriptor tracks anisotropy extent and direction.
+ 14. The cross-lattice velocity-consistency loss (v2.1 Training §3).
 
 Run from the HermiteFlow-Code root:
 
@@ -37,11 +42,16 @@ sys.path.insert(0, os.path.join(ROOT, "src"))
 from models.hermite_vfi.configs import HermiteFlowConfig  # noqa: E402
 from models.hermite_vfi.hermiteflow_base import HermiteFlowBase  # noqa: E402
 from models.hermite_vfi.modules.phase1_measure import (  # noqa: E402
+    blur_descriptor,
     brightness_consistency,
-    flow_scale,
     forward_backward_error,
 )
-from models.hermite_vfi.modules.phase2_coeffnet import CoeffNet  # noqa: E402
+from models.hermite_vfi.modules.phase2_coeffnet import (  # noqa: E402
+    CONTEXT_CHANNELS,
+    HIDDEN_CHANNELS,
+    CoeffNet,
+    convex_upsample,
+)
 from models.hermite_vfi.modules.phase3_evaluate import (  # noqa: E402
     DEGREES,
     coefficients_from_residuals,
@@ -66,16 +76,34 @@ def check(name, condition, detail=""):
     print(f"  [{status}] {name}" + (f"  ({detail})" if detail else ""))
 
 
+def _center_tap_mask(batch, h, w, device, dtype):
+    """
+    A convex-upsample mask (RAFT's W_i convention) whose softmax picks the
+    3x3 neighbourhood's CENTER tap only, for every one of the 8x8
+    sub-pixel positions. Under that mask `convex_upsample` degenerates to
+    plain nearest/block-repeat upsampling (the center tap of `F.unfold`
+    at grid cell (r, c) is just the input pixel at (r, c) itself), which
+    is easy to check analytically - see test_end_to_end and the ConvexUp
+    tests below.
+    """
+    mask = torch.full((batch, 576, h, w), -1.0e4, device=device, dtype=dtype)
+    mask[:, 4 * 64 : 5 * 64] = 0.0  # tap index 4 of 9 == the center tap
+    return mask
+
+
 class _StubFlowModel(HermiteFlowBase):
     """
     HermiteFlow with a deterministic, parameter-free flow estimator: a
     rigid translation of (+3, -2) from frame 0 to frame 1.
 
-    `estimate_flows` is overridden so the backward flow is the true
-    negation. That matters: a stub returning the same vector in both
-    directions makes U = |F + F'| large everywhere, the occlusion gate
-    then correctly shuts, and every downstream test silently measures a
-    model that has been told to distrust its own flow.
+    `flow_with_context` is overridden so the backward flow is the true
+    negation, and so it hands Phase 2 fixed-shape, deterministic stand-ins
+    for RAFT's context, final hidden state and convex-upsample mask - a
+    real RAFT is not needed to exercise Phase 2's own logic. A stub
+    returning the same flow vector in both directions makes U = |F + F'|
+    large everywhere, the occlusion gate then correctly shuts, and every
+    downstream test would silently measure a model that has been told to
+    distrust its own flow - hence the explicit negation.
     """
 
     BASE_FLOW = (3.0, -2.0)
@@ -97,12 +125,40 @@ class _StubFlowModel(HermiteFlowBase):
         # Used only by the privileged teacher, which asks for f_{0->t}.
         return self._constant_flow(img_a, 1.0)
 
+    def flow_with_context(self, img_a, img_b, iters=None):
+        batch, _, height, width = img_a.shape
+        h, w = height // 8, width // 8
+        # `measure()` calls this once as (img0, img1) and once as
+        # (img1, img0) and needs the two results to be true negations of
+        # each other (U = 0, gate open) - see the class docstring. There
+        # is no "am I the forward call" flag available here, so the sign
+        # is derived from an order-independent, antisymmetric-under-swap
+        # rule instead: whichever image has the larger sum is arbitrarily
+        # "img0" for sign purposes. Collision probability is zero for
+        # independently-drawn random test tensors.
+        sign = 1.0 if img_a.sum().item() >= img_b.sum().item() else -1.0
+        flow = self._constant_flow(img_a, sign)
+        # Deterministic, parameter-free stand-ins for c_i / h_i^(N):
+        # different pooled projections of the two input images, so tests
+        # that check the context/hidden ablation switches actually see a
+        # difference when they zero one out.
+        context = torch.nn.functional.adaptive_avg_pool2d(img_a, (h, w)).repeat(
+            1, CONTEXT_CHANNELS // 3 + 1, 1, 1
+        )[:, :CONTEXT_CHANNELS]
+        hidden = torch.nn.functional.adaptive_avg_pool2d(img_b, (h, w)).repeat(
+            1, HIDDEN_CHANNELS // 3 + 1, 1, 1
+        )[:, :HIDDEN_CHANNELS]
+        mask = _center_tap_mask(batch, h, w, img_a.device, img_a.dtype)
+        return flow, context, hidden, mask
+
 
 def _config(**overrides):
     """A narrow test config, built the same way the trainer builds it."""
     base = dict(
         ema=False,
-        coeff_net_channels=16,
+        appnet_channels=16,
+        coeff_head_channels=16,
+        coeff_head_blocks=1,
         refine_net_channels=16,
         refine_net_blocks=1,
         synth_net_channels=16,
@@ -115,6 +171,28 @@ def _config(**overrides):
 def _random_residuals(shape, scale=30.0, seed=0):
     g = torch.Generator().manual_seed(seed)
     return [torch.randn(*shape, generator=g) * scale for _ in range(3)]
+
+
+def _coeff_net_inputs(batch=2, h=32, w=32, seed=0):
+    """
+    A full set of CoeffNet.forward inputs at full resolution (8h, 8w),
+    with context/hidden/mask at (h, w), shared by every test that needs
+    to drive the new Phase 2 module directly.
+    """
+    g = torch.Generator().manual_seed(seed)
+    height, width = 8 * h, 8 * w
+    return dict(
+        img_src=torch.rand(batch, 3, height, width, generator=g),
+        img_dst_aligned=torch.rand(batch, 3, height, width, generator=g),
+        flow=torch.randn(batch, 2, height, width, generator=g) * 10,
+        flow_bwd_aligned=torch.randn(batch, 2, height, width, generator=g) * 10,
+        occlusion=torch.rand(batch, 1, height, width, generator=g),
+        blur_src=torch.randn(batch, 3, height, width, generator=g),
+        blur_dst_aligned=torch.randn(batch, 3, height, width, generator=g),
+        context=torch.randn(batch, CONTEXT_CHANNELS, h, w, generator=g),
+        hidden=torch.randn(batch, HIDDEN_CHANNELS, h, w, generator=g),
+        mask=torch.randn(batch, 576, h, w, generator=g),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -227,19 +305,14 @@ def test_linear_baseline():
         check(f"Phi(t={t_val}) == t*F when d=0",
               (got - linear_baseline(flow, t)).abs().max().item() < TOL)
 
-    net = CoeffNet(channels=16)
-    residuals = net(
-        torch.rand(2, 3, 32, 32),
-        torch.rand(2, 3, 32, 32),
-        torch.randn(2, 2, 32, 32) * 10,
-        torch.randn(2, 2, 32, 32) * 10,
-        torch.rand(2, 1, 32, 32),
-        flow_scale(torch.randn(2, 2, 32, 32), torch.randn(2, 2, 32, 32)),
-    )
+    net = CoeffNet(appnet_channels=16, coeff_head_channels=16, coeff_head_blocks=1)
+    residuals, alpha = net(**_coeff_net_inputs())
     check("freshly initialised CoeffNet outputs d0 = 0",
           residuals[0].abs().max().item() < TOL)
     check("freshly initialised CoeffNet outputs d1 = 0",
           residuals[1].abs().max().item() < TOL)
+    check("gate map has the right shape and range", tuple(alpha.shape[1:]) == (1, 256, 256)
+          and alpha.min().item() >= 0.0 and alpha.max().item() <= 1.0)
 
 
 def test_degree_switch():
@@ -295,43 +368,51 @@ def test_residual_bound():
     # gradient magnitude, so that soft direction can random-walk away.
     # tanh caps it. Two things must both hold: the cap must be HARD,
     # and it must be invisible at the magnitudes real training uses.
+    #
+    # v2.1: the cap applies to d_i^down8 (1/8-res, pre-ConvexUp), in
+    # RAFT's own 1/8-pixel units, not `bound * scale` - Phase 2 no
+    # longer normalises by a per-clip motion scale.
     bound = 2.0
-    net = CoeffNet(channels=16, residual_bound=bound)
-    scale = torch.full((2, 1, 1, 1), 20.0)
-    args = (torch.rand(2, 3, 32, 32), torch.rand(2, 3, 32, 32),
-            torch.randn(2, 2, 32, 32), torch.randn(2, 2, 32, 32),
-            torch.zeros(2, 1, 32, 32), scale)
+    net = CoeffNet(
+        appnet_channels=16, coeff_head_channels=16, coeff_head_blocks=1,
+        residual_bound=bound,
+    )
+    inputs = _coeff_net_inputs()
 
     # Drive the heads far past any plausible solution.
     for head in net.heads:
         torch.nn.init.normal_(head.weight, std=5.0)
         torch.nn.init.normal_(head.bias, std=50.0)
     with torch.no_grad():
-        blown = net(*args)
-    cap = bound * scale.max().item()
+        blown, alpha = net(**inputs)
+    # tanh caps |d_i^down8| at `bound`; the x8 ConvexUp scales that by 8
+    # and is a convex combination (softmax weights sum to 1) of a 3x3
+    # neighbourhood, so it cannot exceed the max of its inputs; the gate
+    # only shrinks further (alpha in [0, 1]).
+    cap = 8.0 * bound
     worst = max(r.abs().max().item() for r in blown)
-    check("|d_i| is capped at residual_bound * s under extreme weights",
-          worst <= cap + TOL, f"max |d| = {worst:.2f} px, cap = {cap:.2f} px")
+    check("|d_i| is capped at 8*residual_bound post-upsample, under extreme weights",
+          worst <= cap + TOL, f"max |d| = {worst:.2f} (1/8-px units), cap = {cap:.2f}")
     check("the capped output is finite",
-          all(torch.isfinite(r).all().item() for r in blown))
+          all(torch.isfinite(r).all().item() for r in blown)
+          and torch.isfinite(alpha).all().item())
 
-    # At the magnitude the oracle actually wants (~0.375 s) the tanh
-    # must be the identity to well under measurement noise, otherwise
-    # the cap would quietly bias the science.
-    want = 0.375
-    err = abs(bound * math.tanh(want / bound) - want) / want
-    check("cap is numerically inert at the oracle's |d| ~ 0.375 s",
-          err < 0.02, f"relative distortion {err:.3%}")
-    at_current = 0.19 / 20.0
-    err2 = abs(bound * math.tanh(at_current / bound) - at_current) / at_current
-    check("cap is inert at the |d| training currently reaches",
-          err2 < 1e-4, f"relative distortion {err2:.2e}")
+    # A representative small |d| (well inside anything realistic): the
+    # tanh must be the identity to well under measurement noise, or the
+    # cap would quietly bias every run near init.
+    at_small = 0.05
+    err = abs(bound * math.tanh(at_small / bound) - at_small) / at_small
+    check("cap is numerically inert at a representative small |d|",
+          err < 1e-3, f"relative distortion {err:.2e}")
 
     # Small-signal gradient must be untouched: heads are zero-init, so
     # a changed slope at zero would change how training leaves linear.
-    net2 = CoeffNet(channels=16, residual_bound=bound)
+    net2 = CoeffNet(
+        appnet_channels=16, coeff_head_channels=16, coeff_head_blocks=1,
+        residual_bound=bound,
+    )
     with torch.no_grad():
-        out = net2(*args)
+        out, _ = net2(**inputs)
     check("zero-init heads still start exactly at the linear baseline",
           all(r.abs().max().item() < TOL for r in out))
 
@@ -432,17 +513,30 @@ def test_flow_augmentation():
 
 def test_occlusion_gate():
     print("\n5. Occlusion gate and Phase 1 signals")
-    net = CoeffNet(channels=16)
+    net = CoeffNet(appnet_channels=16, coeff_head_channels=16, coeff_head_blocks=1)
     gate = net.gate
 
     consistent = gate(torch.zeros(1, 1, 4, 4)).mean().item()
-    occluded = gate(torch.ones(1, 1, 4, 4)).mean().item()
-    check("gate open where the flow is consistent (U=0)", consistent > 0.99,
+    occluded = gate(torch.full((1, 1, 4, 4), 5.0)).mean().item()
+    # sigmoid(gate_init_bias) at U=0 - 0.8808 at the default bias=2.0.
+    check("gate open where the flow is consistent (U=0)", consistent > 0.85,
           f"alpha = {consistent:.4f}")
-    check("gate shut where the flow is inconsistent (U=s)", occluded < 0.01,
+    check("gate shut where the flow is grossly inconsistent (U large)", occluded < 0.01,
           f"alpha = {occluded:.6f}")
     check("w2 stays non-negative under softplus",
           torch.nn.functional.softplus(gate.w2_raw).item() > 0)
+
+    # Gate order (v2.1, locked in over the doc's appendix/main-body
+    # mismatch): applied AFTER ConvexUp, on the FULL-RESOLUTION U, not a
+    # downsampled U^{down8}. Pin it exactly - CoeffNet's returned alpha
+    # must equal gate() called directly on the very same full-res tensor.
+    inputs = _coeff_net_inputs()
+    with torch.no_grad():
+        _, alpha = net(**inputs)
+        direct = net.gate(inputs["occlusion"])
+    check("gate runs on full-resolution U, post-upsample (not U^{down8})",
+          alpha.shape == inputs["occlusion"].shape
+          and (alpha - direct).abs().max().item() < TOL)
 
     flow = torch.zeros(1, 2, 8, 8)
     flow[:, 0] = 2.0
@@ -467,60 +561,91 @@ def test_occlusion_gate():
           f"mean Z = {z_bad.mean().item():.3f}")
 
 
-def test_rgb_branch_switch():
-    print("\n6. RGB branch is a pure runtime switch (experiment 1)")
+def test_ablation_switches():
+    print("\n6. Phase 2 ablation gates are pure runtime switches (v2.1)")
     torch.manual_seed(0)
-    net = CoeffNet(channels=16)
-    # Give the heads a non-trivial map so outputs are not identically zero.
+
+    def fresh_net():
+        net = CoeffNet(appnet_channels=16, coeff_head_channels=16, coeff_head_blocks=1)
+        # Give the heads a non-trivial map so outputs are not identically
+        # zero, so "toggling changes the prediction" is a real check.
+        with torch.no_grad():
+            for head in net.heads:
+                head.weight.normal_(0, 0.05)
+        return net
+
+    inputs = _coeff_net_inputs()
+
+    # -------- use_appearance: AppNet has real parameters to zero --------
+    net = fresh_net()
+    net.set_appearance(True)
+    with_app = net(**inputs)[0][0]
+    net.set_appearance(False)
+    without_app = net(**inputs)[0][0]
+    check("toggling use_appearance changes the prediction",
+          (with_app - without_app).abs().max().item() > 1e-6)
+
     with torch.no_grad():
-        for head in net.heads:
-            head.weight.normal_(0, 0.05)
-
-    args = (
-        torch.rand(2, 3, 32, 32),
-        torch.rand(2, 3, 32, 32),
-        torch.randn(2, 2, 32, 32) * 10,
-        torch.randn(2, 2, 32, 32) * 10,
-        torch.rand(2, 1, 32, 32) * 0.01,
-        flow_scale(torch.randn(2, 2, 32, 32), torch.randn(2, 2, 32, 32)),
-    )
-
-    net.set_rgb_branch(True)
-    with_rgb = net(*args)[0]
-    net.set_rgb_branch(False)
-    without_rgb = net(*args)[0]
-
-    check("toggling the RGB branch changes the prediction",
-          (with_rgb - without_rgb).abs().max().item() > 1e-6)
-
-    # The flow branch must be untouched by the switch: with the RGB
-    # branch off, the result must equal what a flow-only encode gives.
-    # Additive fusion is what guarantees this; concatenation would not.
-    flow_feat = net.flow_branch(
-        torch.cat([args[2] / args[5], args[3] / args[5], args[4] / args[5]], dim=1)
-    )
-    net.set_rgb_branch(True)
-    rgb_feat = net.rgb_branch(torch.cat([args[0], args[1]], dim=1))
-    check("fusion is additive: feat(off) + rgb == feat(on)",
-          True,  # structural, asserted by construction below
-          "checked via the identity test that follows")
-
-    # With the RGB branch's output forced to zero, the two paths coincide.
-    with torch.no_grad():
-        for module in net.rgb_branch.modules():
+        for module in net.app_net.modules():
             if isinstance(module, torch.nn.Conv2d):
                 module.weight.zero_()
                 if module.bias is not None:
                     module.bias.zero_()
-    net.set_rgb_branch(True)
-    zeroed_rgb = net(*args)[0]
-    net.set_rgb_branch(False)
-    branch_off = net(*args)[0]
-    check("zeroing the RGB branch == switching it off",
-          (zeroed_rgb - branch_off).abs().max().item() < TOL,
-          f"max diff = {(zeroed_rgb - branch_off).abs().max().item():.2e}")
-    check("flow branch output is independent of the switch",
-          flow_feat.shape[1] == rgb_feat.shape[1])
+    net.set_appearance(True)
+    zeroed_app = net(**inputs)[0][0]
+    net.set_appearance(False)
+    branch_off = net(**inputs)[0][0]
+    check("zeroing AppNet's weights == set_appearance(False)",
+          (zeroed_app - branch_off).abs().max().item() < TOL,
+          f"max diff = {(zeroed_app - branch_off).abs().max().item():.2e}")
+
+    # -------- use_context: c_i/h_i^(N) are external inputs, no weights
+    # of their own to zero - the equivalence is against manually zeroing
+    # those two inputs while the switch stays on. --------
+    net = fresh_net()
+    net.set_context(True)
+    with_ctx = net(**inputs)[0][0]
+    net.set_context(False)
+    without_ctx = net(**inputs)[0][0]
+    check("toggling use_context changes the prediction",
+          (with_ctx - without_ctx).abs().max().item() > 1e-6)
+
+    zeroed_inputs = dict(inputs)
+    zeroed_inputs["context"] = torch.zeros_like(inputs["context"])
+    zeroed_inputs["hidden"] = torch.zeros_like(inputs["hidden"])
+    net.set_context(True)
+    manually_zeroed = net(**zeroed_inputs)[0][0]
+    check("zeroing context/hidden inputs == set_context(False)",
+          (manually_zeroed - without_ctx).abs().max().item() < TOL,
+          f"max diff = {(manually_zeroed - without_ctx).abs().max().item():.2e}")
+
+    # -------- use_blur: only the B_i channels feeding AppNet, same
+    # zero-the-input-group equivalence, but AppNet stays active. --------
+    net = fresh_net()
+    net.set_blur(True)
+    with_blur = net(**inputs)[0][0]
+    net.set_blur(False)
+    without_blur = net(**inputs)[0][0]
+    check("toggling use_blur changes the prediction",
+          (with_blur - without_blur).abs().max().item() > 1e-6)
+
+    zeroed_inputs = dict(inputs)
+    zeroed_inputs["blur_src"] = torch.zeros_like(inputs["blur_src"])
+    zeroed_inputs["blur_dst_aligned"] = torch.zeros_like(inputs["blur_dst_aligned"])
+    net.set_blur(True)
+    manually_zeroed = net(**zeroed_inputs)[0][0]
+    check("zeroing blur inputs == set_blur(False)",
+          (manually_zeroed - without_blur).abs().max().item() < TOL,
+          f"max diff = {(manually_zeroed - without_blur).abs().max().item():.2e}")
+
+    # -------- "flow-only (strict)": no-appearance + no-context together,
+    # matching the doc's ablation table. --------
+    net = fresh_net()
+    net.set_appearance(False)
+    net.set_context(False)
+    strict = net(**inputs)[0][0]
+    check("flow-only (strict) still produces a finite prediction",
+          torch.isfinite(strict).all().item())
 
 
 def test_splat():
@@ -740,17 +865,19 @@ def test_degree_end_to_end():
 def test_no_unused_parameters():
     """
     DDP runs with find_unused_parameters=False, which is a hard error if
-    any trainable parameter misses a gradient. The two configurations
-    that can produce one are the ablations: an unused quartic head, and
-    an RGB branch that has been switched off.
+    any trainable parameter misses a gradient. The configurations that
+    can produce one are the ablations: an unused quartic head, and the
+    appearance branch switched off.
     """
     print("\n14. No trainable parameter is left unused (DDP safety)")
     img_xs = torch.rand(1, 3, 2, 64, 64)
     times = [torch.tensor([0.3]), torch.tensor([0.7])]
 
     for degree in DEGREES:
-        for use_rgb in (True, False):
-            model = _StubFlowModel(_config(degree=degree, use_rgb_branch=use_rgb))
+        for use_appearance in (True, False):
+            model = _StubFlowModel(
+                _config(degree=degree, use_appearance=use_appearance)
+            )
             model.train()
             # One step first, so the zero-init heads stop masking the rest.
             opt = torch.optim.AdamW(
@@ -765,10 +892,168 @@ def test_no_unused_parameters():
                 n for n, p in model.named_parameters()
                 if p.requires_grad and (p.grad is None or p.grad.abs().sum().item() == 0)
             ]
-            label = f"degree={degree}, rgb={'on' if use_rgb else 'off'}"
+            label = f"degree={degree}, appearance={'on' if use_appearance else 'off'}"
             check(f"[{label}] every trainable parameter receives gradient",
                   len(starved) == 0,
                   f"starved: {starved[:2]}" if starved else "")
+
+
+def test_convex_upsample():
+    print("\n15. ConvexUp reuses RAFT's own upsample formula exactly")
+    from models.hermite_vfi.raft.raft import RAFT
+
+    torch.manual_seed(0)
+    batch, h, w = 2, 5, 7
+    flow = torch.randn(batch, 2, h, w)
+    mask = torch.randn(batch, 576, h, w)
+
+    # RAFT.upsample_flow does not touch `self` (pure tensor math over its
+    # arguments), so it can be called unbound to compare directly against
+    # what it does internally on a real flow-refinement iteration.
+    reference = RAFT.upsample_flow(None, flow, mask)
+    ours = convex_upsample(8.0 * flow, mask)
+    check("convex_upsample(8*flow, mask) == RAFT.upsample_flow(flow, mask)",
+          (reference - ours).abs().max().item() < TOL,
+          f"max diff = {(reference - ours).abs().max().item():.2e}")
+
+    # Generalises to any channel count (CoeffHead batches every active
+    # residual head through one call) - stack two "flows" and check each
+    # slice still matches the per-call reference independently.
+    flow2 = torch.randn(batch, 2, h, w)
+    stacked = convex_upsample(8.0 * torch.cat([flow, flow2], dim=1), mask)
+    ref2 = RAFT.upsample_flow(None, flow2, mask)
+    check("convex_upsample generalises to multi-head channel stacking",
+          (stacked[:, :2] - reference).abs().max().item() < TOL
+          and (stacked[:, 2:] - ref2).abs().max().item() < TOL)
+
+    # Center-tap-only mask degenerates to block-repeat upsampling - the
+    # same mask construction _StubFlowModel uses.
+    center_mask = _center_tap_mask(batch, h, w, flow.device, flow.dtype)
+    block_repeat = convex_upsample(8.0 * flow, center_mask)
+    expected = (8.0 * flow).repeat_interleave(8, dim=2).repeat_interleave(8, dim=3)
+    check("center-tap mask degenerates to plain block-repeat upsampling",
+          (block_repeat - expected).abs().max().item() < 1e-3,
+          f"max diff = {(block_repeat - expected).abs().max().item():.2e}")
+
+
+def test_blur_descriptor():
+    print("\n16. Blur descriptor tracks anisotropy extent and direction")
+    size = 64
+    coords = torch.arange(size, dtype=torch.float32)
+
+    # Purely horizontal gradient (a grating varying only along x): the
+    # structure tensor collapses to a single nonzero eigenvalue, so
+    # anisotropy should be extreme (saturate the clamp) and the dominant
+    # orientation should point along the x-axis: cos(2*theta) ~ +1.
+    x_grating = torch.sin(2 * math.pi * coords / 8.0).view(1, 1, size).expand(1, size, size)
+    img_x = x_grating.unsqueeze(0).repeat(1, 3, 1, 1)
+    b_x = blur_descriptor(img_x)
+    interior = b_x[:, :, 8:-8, 8:-8]
+    check("purely horizontal texture saturates the anisotropy clamp",
+          interior[:, 0].mean().item() > 40.0,
+          f"mean anisotropy = {interior[:, 0].mean().item():.2f}")
+    check("purely horizontal texture: cos(2*theta) ~= +1",
+          interior[:, 1].mean().item() > 0.9,
+          f"mean cos2theta = {interior[:, 1].mean().item():.4f}")
+
+    # Purely vertical gradient: same extremity, opposite orientation -
+    # cos(2*theta) flips sign (0 and 90 degrees differ by pi under the
+    # doubled angle), pinning down that the sign is meaningful, not
+    # arbitrary.
+    y_grating = x_grating.transpose(-1, -2)
+    img_y = y_grating.unsqueeze(0).repeat(1, 3, 1, 1)
+    b_y = blur_descriptor(img_y)
+    interior_y = b_y[:, :, 8:-8, 8:-8]
+    check("purely vertical texture: cos(2*theta) ~= -1",
+          interior_y[:, 1].mean().item() < -0.9,
+          f"mean cos2theta = {interior_y[:, 1].mean().item():.4f}")
+
+    # Uncorrelated random noise has no preferred direction; anisotropy
+    # should stay well clear of the clamp on average (a soft check - any
+    # single random draw has some measurable anisotropy, but not extreme).
+    torch.manual_seed(0)
+    noise = torch.rand(1, 3, size, size)
+    b_n = blur_descriptor(noise)
+    check("unstructured noise anisotropy stays well below the clamp",
+          b_n[:, 0].mean().item() < 10.0,
+          f"mean anisotropy = {b_n[:, 0].mean().item():.2f}")
+
+    check("blur descriptor is finite everywhere",
+          torch.isfinite(b_x).all().item() and torch.isfinite(b_n).all().item())
+
+
+def test_velocity_consistency_loss():
+    print("\n17. Cross-lattice velocity-consistency loss (v2.1 Training §3)")
+    from models.hermite_vfi.modules.fi_utils import warp
+
+    def vel_consistency_loss(outputs):
+        # Same formula as Trainer.velocity_consistency_loss, reimplemented
+        # here so this file does not have to import the trainer (and its
+        # heavier deps - LPIPS, tqdm, torchvision) just to check the math.
+        flow_fwd = outputs["raft_flow"][:, :, 0]
+        flow_bwd = outputs["raft_flow"][:, :, 1]
+        term0 = (1.0 - outputs["alpha_fwd"]) * (
+            outputs["m1"] + warp(outputs["m0_swapped"], flow_fwd)
+        )
+        term1 = (1.0 - outputs["alpha_bwd"]) * (
+            outputs["m0"] + warp(outputs["m1_swapped"], flow_bwd)
+        )
+        return 0.5 * (term0.abs().mean() + term1.abs().mean())
+
+    batch, h, w = 1, 16, 16
+    flow_fwd = torch.zeros(batch, 2, h, w)
+    flow_fwd[:, 0] = 3.0
+    flow_bwd = -flow_fwd
+    raft_flow = torch.stack([flow_fwd, flow_bwd], dim=2)
+
+    # Exactly-consistent case: m0'/m1' constructed so the doc's identity
+    # m1(x) = -backwarp(m0', F)(x) holds exactly (flow is a constant
+    # translation, so backwarp of a constant field is that field itself).
+    m0_swapped = torch.randn(batch, 2, h, w)
+    m1 = -m0_swapped
+    m1_swapped = torch.randn(batch, 2, h, w)
+    m0 = -m1_swapped
+    consistent = dict(
+        raft_flow=raft_flow, m0=m0, m1=m1,
+        m0_swapped=m0_swapped, m1_swapped=m1_swapped,
+        alpha_fwd=torch.ones(batch, 1, h, w),
+        alpha_bwd=torch.ones(batch, 1, h, w),
+    )
+    loss_consistent = vel_consistency_loss(consistent)
+    check("exactly-consistent lattices give zero loss",
+          loss_consistent.item() < 1e-6, f"loss = {loss_consistent.item():.2e}")
+
+    # Same fields, but alpha = 0 (weight everything, per the doc's
+    # (1 - alpha_occ) convention) and the lattices now genuinely disagree.
+    inconsistent = dict(consistent)
+    inconsistent["m1"] = m1 + 5.0
+    inconsistent["alpha_fwd"] = torch.zeros(batch, 1, h, w)
+    inconsistent["alpha_bwd"] = torch.zeros(batch, 1, h, w)
+    loss_inconsistent = vel_consistency_loss(inconsistent)
+    check("disagreeing lattices with alpha=0 give a large loss",
+          loss_inconsistent.item() > 2.0, f"loss = {loss_inconsistent.item():.3f}")
+
+    # alpha = 1 (fully trusted) on the same disagreement: per the doc's
+    # literal (1 - alpha_occ) weighting this term drops OUT, not in -
+    # pin that this is what's implemented, not the reverse.
+    inconsistent["alpha_fwd"] = torch.ones(batch, 1, h, w)
+    inconsistent["alpha_bwd"] = torch.ones(batch, 1, h, w)
+    loss_trusted = vel_consistency_loss(inconsistent)
+    check("(1 - alpha_occ) weighting: alpha=1 mutes a disagreement, not amplifies it",
+          loss_trusted.item() < 1e-6, f"loss = {loss_trusted.item():.2e}")
+
+    # Gradient reaches both m1 and the warped m0_swapped path.
+    grad_case = {
+        k: (v.clone().requires_grad_(True) if k in ("m1", "m0_swapped") else v)
+        for k, v in inconsistent.items()
+    }
+    grad_case["alpha_fwd"] = torch.full((batch, 1, h, w), 0.3)
+    vel_consistency_loss(grad_case).backward()
+    check("gradient reaches m1 and m0_swapped (through warp)",
+          grad_case["m1"].grad is not None
+          and grad_case["m1"].grad.abs().sum().item() > 0
+          and grad_case["m0_swapped"].grad is not None
+          and grad_case["m0_swapped"].grad.abs().sum().item() > 0)
 
 
 def main():
@@ -785,7 +1070,7 @@ def main():
     test_residual_bound()
     test_configs_match_schema()
     test_flow_augmentation()
-    test_rgb_branch_switch()
+    test_ablation_switches()
     test_splat()
     test_splat_backends()
     test_neutral_inits()
@@ -794,6 +1079,9 @@ def main():
     test_downscaled_inference()
     test_degree_end_to_end()
     test_no_unused_parameters()
+    test_convex_upsample()
+    test_blur_descriptor()
+    test_velocity_consistency_loss()
 
     print("\n" + "=" * 68)
     print(f"{len(PASSED)} passed, {len(FAILED)} failed")

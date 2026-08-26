@@ -105,6 +105,7 @@ class RAFT(nn.Module):
         upsample=True,
         test_mode=False,
         return_feat=True,
+        return_context=False,
     ):
         """Estimate optical flow between pair of frames"""
 
@@ -162,6 +163,19 @@ class RAFT(nn.Module):
 
         if test_mode:
             return coords1 - coords0, flow_up
+
+        if return_context:
+            # HermiteFlow v2.1's Phase 2 (AppNet + CoeffHead) reads RAFT's own
+            # internal state directly instead of running a separate encoder:
+            #   inp     - context features, ReLU half of cnet's split output
+            #             (doc's c_i), computed once before the GRU loop.
+            #   net     - the FINAL GRU hidden state after `iters` refinement
+            #             steps (doc's h_i^(N)); already the right value here,
+            #             the loop above does not touch it after this point.
+            #   up_mask - the FINAL iteration's raw (pre-softmax) convex-
+            #             upsample mask logits (doc's W_i), reused verbatim by
+            #             CoeffHead's own upsample instead of a learned mask.
+            return flow_up, inp, net, up_mask
 
         if return_feat:
             return flow_up, feats[1:], fmap1

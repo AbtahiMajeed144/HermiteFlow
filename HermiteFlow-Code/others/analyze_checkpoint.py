@@ -10,7 +10,7 @@ against zero. Five questions in one pass:
   3. Are d0 and d1 doing different jobs, or has the network collapsed
      onto the symmetric mode - which barely bends the curve at all?
   4. Is the occlusion gate open, or suppressing everything?
-  5. How much does the RGB branch contribute?
+  5. How much does the appearance branch (AppNet) contribute?
 
     python others/analyze_checkpoint.py \
         --checkpoint /kaggle/working/runs/<run>/epoch1_model.pt \
@@ -24,7 +24,6 @@ import os
 import sys
 
 import torch
-import torch.nn as nn
 
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
@@ -65,29 +64,23 @@ def match_architecture(model, state):
     """
     Make the constructed model match the checkpoint's architecture.
 
-    Checkpoints written before the GroupNorm branches have no
-    `flow_branch.layers.3` and no `gain`. Loading those with
-    strict=False "works" - and is silently wrong: GroupNorm at init is
-    NOT the identity (weight=1, bias=0 still normalises), so the trunk
-    would run on normalised features it was never trained for and the
-    analysis would report a model that learned nothing.
-
-    Detect it and drop the GroupNorm instead, so the evaluated function
-    is exactly the one that was trained.
+    v2.1 replaced Phase 2's full-res CNN CoeffNet (flow_branch/rgb_branch,
+    down1/up1, ...) with AppNet + CoeffHead (app_net, fuse, trunk, ...) -
+    a different module tree, not a variant of the same one. A v1
+    checkpoint cannot be patched into a v2.1 model the way the earlier
+    GroupNorm addition could (that changed layer counts inside the same
+    branches; this changes which branches exist at all), so refuse rather
+    than silently evaluate an unrelated, effectively-random Phase 2.
     """
-    has_groupnorm = any(k.endswith("flow_branch.layers.3.weight") for k in state)
-    if has_groupnorm:
-        return "current (GroupNorm branches)", set()
-    for branch in (model.coeff_net.flow_branch, model.coeff_net.rgb_branch):
-        if len(branch.layers) > 3:
-            branch.layers = nn.Sequential(*list(branch.layers)[:3])
-        with torch.no_grad():
-            branch.gain.fill_(1.0)   # unit gain == the legacy behaviour
-    handled = {
-        "coeff_net.flow_branch.gain",
-        "coeff_net.rgb_branch.gain",
-    }
-    return "legacy (pre-GroupNorm; GroupNorm dropped, gains pinned to 1)", handled
+    is_v2 = any(k.startswith("coeff_net.app_net.") for k in state)
+    if is_v2:
+        return "current (v2.1 AppNet + CoeffHead)", set()
+    sys.exit(
+        "this checkpoint predates v2.1 (no coeff_net.app_net.* keys - it "
+        "was trained with the old full-resolution CoeffNet). Analyse it "
+        "with this script from the `main` branch instead; there is no "
+        "way to evaluate it under the current AppNet+CoeffHead model."
+    )
 
 
 class Meter:
@@ -250,9 +243,9 @@ def main():
                 f"do not describe the same network."
             )
 
-        for rgb in (True, False):
-            model.coeff_net.set_rgb_branch(rgb)
-            key = label if rgb else f"{label} -RGB"
+        for appearance in (True, False):
+            model.coeff_net.set_appearance(appearance)
+            key = label if appearance else f"{label} -appearance"
             meter = Meter()
             d0s, d1s, gates = [], [], []
 
@@ -267,17 +260,17 @@ def main():
                         per_t.setdefault(c["times"][k], {}).setdefault(
                             key, Meter()
                         ).add(err)
-                    if rgb:
-                        res0, _ = model.predict_velocities(
+                    if appearance:
+                        res0, _, _, _ = model.predict_velocities(
                             c["img_xs"][:, :, 0], c["img_xs"][:, :, 1], c["measured"]
                         )
                         d0s.append(res0[0]); d1s.append(res0[1])
-                        gates.append(model.coeff_net.gate(
-                            c["measured"]["occ_fwd"] / c["measured"]["scale"]
-                        ))
+                        # Gate now runs on raw, full-res occlusion (v2.1
+                        # dropped Phase 2's per-clip scale normalisation).
+                        gates.append(model.coeff_net.gate(c["measured"]["occ_fwd"]))
 
             results[key] = meter.db
-            if rgb:
+            if appearance:
                 d0 = torch.cat([x.flatten() for x in d0s])
                 d1 = torch.cat([x.flatten() for x in d1s])
                 sym = (d0 + d1) / 2
@@ -313,7 +306,7 @@ def main():
         print("  oracle: needs num_timesteps > 3 for a leave-one-out fit")
 
     print("\nPER-TIMESTEP   gain over linear, dB\n")
-    cols = [k for k in results if "-RGB" not in k]
+    cols = [k for k in results if "-appearance" not in k]
     print(f"  {'t':<9}" + "".join(f"{k:>14}" for k in cols))
     for t in sorted(per_t):
         if "linear" not in per_t[t]:
@@ -342,8 +335,8 @@ def main():
         print(f"  {label:<10} alpha mean {mean:.4f}   5th pct {p05:.4f}"
               f"   (1.0 = fully trusting the flow)")
 
-    print("\nNote: the '-RGB' rows ablate the branch AT INFERENCE on a model")
-    print("trained WITH it, so they measure reliance, not necessity.")
+    print("\nNote: the '-appearance' rows ablate AppNet AT INFERENCE on a")
+    print("model trained WITH it, so they measure reliance, not necessity.")
     print("Experiment (1) still needs a flow-only model trained from scratch.")
 
 

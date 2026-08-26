@@ -25,37 +25,66 @@ class HermiteFlowConfig:
     # Everything in pixel units is normalised by s before entering a CNN.
     min_flow_scale: float = 1.0
 
-    # ---- Phase 2: endpoint velocities ----
-    coeff_net_channels: int = 64
-    # Occlusion gate alpha = sigmoid(w1 - w2 * U/s), initial values.
-    # w1 = 5.0 and w2 = 20.0 put the half-way point at U/s = 0.25,
-    # i.e. a forward-backward error of a quarter of the clip's peak
-    # motion, and start the gate wide open for consistent flow.
-    gate_init_bias: float = 5.0
-    gate_init_scale: float = 20.0
-    # Experiment (1): the CoeffNet input ablation the headline claim
-    # rests on. False keeps the flow branch (F, backwarp(F',F), U) and
-    # drops the RGB branch (I0, backwarp(I1,F)). The branches are fused
-    # by addition, so this is a pure runtime switch - the same
-    # checkpoint runs either way and the flow branch needs no retraining.
-    use_rgb_branch: bool = True
-    # Hard cap on |d_i|, in units of the motion scale s, applied with a
-    # tanh so the map is exactly linear for small residuals.
+    # ---- Phase 2: endpoint velocities (v2.1: AppNet + CoeffHead) ----
+    # AppNet's final-stage width; internal stem is (base//2, base, base),
+    # i.e. 32 -> 64 -> 64 at the default 64. CoeffHead's fusion + trunk
+    # width and its LateralBlock count - the doc's falsification test
+    # asks for both a "3x128" and a "2x96" head to be run and compared,
+    # so these are knobs, not hardcoded.
+    appnet_channels: int = 64
+    coeff_head_channels: int = 96
+    coeff_head_blocks: int = 2
+    # Occlusion gate alpha = sigmoid(w1 - w2 * U), initial values. v2.1
+    # drops Phase 2's per-clip motion-scale normalisation (see
+    # residual_bound below), so U here is RAW, full-resolution pixels,
+    # not U/s. w1=2.0, w2=4.0 puts the half-way point at U = 0.5px, a
+    # rough "well-tracked" threshold at the downsample the X4K configs
+    # use (see hermiteflow_r_x4k_stage1.yaml's U/s measurements). Both
+    # are learned, so this is a starting point, not a calibration that
+    # needs to be exactly right.
+    gate_init_bias: float = 2.0
+    gate_init_scale: float = 4.0
+    # Experiment (1), v2.1 form: the "no-appearance" ablation. False
+    # zeroes AppNet's contribution (S_i) before fusion. AppNet's output
+    # is one group among several concatenated into a single 1x1 fusion
+    # conv, and a 1x1 conv over a concatenation is exactly the sum of
+    # per-group sub-convs - so zeroing a group's input is still a pure,
+    # retrain-free runtime switch, the same guarantee v1's additive
+    # fusion gave under a different mechanism.
+    use_appearance: bool = True
+    # "Flow-only (strict)" ablation: also zero c_i, h_i^(N) (RAFT's
+    # context features and final GRU state) before fusion, on top of
+    # use_appearance=False. h_i^(N) is initialised from RAFT's own
+    # appearance-derived cnet, so it must be zeroed alongside c_i for
+    # the strict gate to be interpretable - see the doc's ablation table.
+    use_context: bool = True
+    # "No-blur" ablation: zero only the blur-descriptor channels feeding
+    # AppNet (B_i, backwarp(B_j,F)), leaving I_i/backwarp(I_j,F) intact.
+    use_blur: bool = True
+    # Hard cap on |d_i^down8|, in RAFT's own 1/8-pixel-unit convention
+    # (v2.1 has no per-clip motion scale in Phase 2 - c_i/h_i^(N) were
+    # trained in that unit system, so Phase 2's flow inputs are converted
+    # to match it instead of being normalised by s). Applied with a tanh
+    # so the map is exactly linear for small residuals, at the 1/8-res
+    # head output, before the x8 ConvexUp step.
     #
     # Phase 3 observes the residuals only through
     #     Phi(t) - t F = beta2(t) [ (t - 1) d0 + t d1 ]
     # whose singular values over t in k/8 are 0.334 and 0.097: the
     # symmetric mode d0 ~ +d1 shifts the trajectory 7.7x less than the
-    # antisymmetric one, by 0.043 px per pixel of residual. The loss
-    # barely constrains that direction, but Adam normalises away
-    # gradient magnitude and steps along it at full size regardless, so
-    # the residuals random-walk. A stage-1 run reached |d0| = 1183 px
-    # while its loss was still 0.026, then overflowed to NaN.
+    # antisymmetric one. The loss barely constrains that direction, but
+    # Adam normalises away gradient magnitude and steps along it at full
+    # size regardless, so the residuals random-walk - v1's CoeffNet hit
+    # exactly this (|d0| = 1183 px at loss 0.026, then NaN) before its
+    # own residual_bound was added; the same failure mode applies here
+    # in the new units.
     #
-    # The oracle wants ~0.375 s, so the default 2.0 sits ~5x clear of
-    # any real solution: distortion is 7.5e-06 at the |d| training
-    # currently reaches. It binds only when a run is already diverging.
-    residual_bound: float = 2.0
+    # 12.0 in 1/8-pixel units is ~96px at full resolution - generously
+    # clear of realistic content on the X4K configs (native |F| ~61px,
+    # ds 3.0 |F| ~22px), binding only once a run is already diverging.
+    # Freshly recalibrated for v2.1; watch delta_0/delta_1 in the first
+    # few thousand steps the way v1's bound was tuned.
+    residual_bound: float = 12.0
 
     # ---- Training stage ----
     # Mirrors GIMM-VFI's two-stage recipe (paper Tab. 5, repo

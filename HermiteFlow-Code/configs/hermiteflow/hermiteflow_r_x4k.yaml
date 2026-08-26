@@ -80,19 +80,25 @@ arch:
   raft_iter: 20
   min_flow_scale: 1.0
 
-  # Phase 2 - endpoint velocities
-  coeff_net_channels: 64
-  gate_init_bias: 5.0
-  gate_init_scale: 20.0
-  use_rgb_branch: true
-  # Hard cap on |d_i|, in units of the motion scale s. The trajectory
-  # loss constrains the symmetric mode d0 ~ d1 ~7.7x more weakly than
-  # the antisymmetric one, and Adam takes full-size steps regardless of
-  # gradient magnitude, so that direction can random-walk away without
-  # the loss objecting (observed: |d0| = 1183 px at loss 0.026). The
-  # oracle asks for ~0.375 s, so 2.0 is ~5x clear of any real solution
-  # and never binds during healthy training.
-  residual_bound: 2.0
+  # Phase 2 - endpoint velocities (v2.1: AppNet + CoeffHead)
+  appnet_channels: 64
+  coeff_head_channels: 96
+  coeff_head_blocks: 2
+  # U here is raw, full-resolution pixels (v2.1 drops Phase 2's per-clip
+  # scale normalisation) - both scalars are learned, this is a starting
+  # point, not a calibration that needs to be exact.
+  gate_init_bias: 2.0
+  gate_init_scale: 4.0
+  use_appearance: true
+  use_context: true
+  use_blur: true
+  # Hard cap on |d_i^down8|, in RAFT's own 1/8-pixel-unit convention (no
+  # per-clip scale in Phase 2 anymore - see configs.py). 12.0 is ~96px
+  # at full resolution, clear of this dataset's motion (native |F|
+  # ~61.5px, ds 3.0 |F| ~22.1px), binding only once a run is already
+  # diverging - same philosophy as v1's residual_bound, freshly
+  # recalibrated for the new units.
+  residual_bound: 12.0
 
   # Phase 3 - trajectory degree: linear | quadratic | cubic | quartic
   degree: cubic
@@ -121,6 +127,9 @@ loss:
   # the step; 12 iterations cuts it to 528 ms and the target is only
   # needed well enough to break the time-to-location ambiguity.
   teacher_raft_iter: 12
+  # Cross-lattice velocity consistency (v2.1 Training, item 3): a
+  # regulariser, not a driver - see hermiteflow_r_x4k_stage1.yaml.
+  velocity_consistency_weight: 0.1
 
 optimizer:
   type: adamw

@@ -141,7 +141,7 @@ is a no-op wrapper.
 | `--resume --load-path <ckpt>` | — | resume optimizer, scheduler and epoch |
 
 Any other field can be set with a trailing dotlist argument, e.g.
-`experiment.batch_size=2 arch.coeff_net_channels=48 arch.splat_impl=auto`.
+`experiment.batch_size=2 arch.coeff_head_channels=128 arch.splat_impl=auto`.
 These flags work identically in train, resume and `--eval` mode.
 
 ### X4K1000FPS — the dataset this model is for
@@ -288,29 +288,39 @@ removed.
 
 | Experiment | Switch | Decides |
 | --- | --- | --- |
-| ① CoeffNet inputs | `arch.use_rgb_branch=false` | whether "curvature from RGB" is real |
+| ① Phase 2 inputs | `arch.use_appearance=false` (and `use_context`, `use_blur`) | whether "curvature from RGB" is real |
 | ② Trajectory degree | `arch.degree=linear\|quadratic\|cubic\|quartic` | whether cubic beats IQ-VFI's quadratic |
 
-The two branches are fused by **addition**, not concatenation, so switching the
-RGB branch off leaves the flow branch's input distribution untouched and needs
-no retraining — which is the whole point of ①. Run it first.
+v2.1's AppNet output is one group among several concatenated into CoeffHead's
+single 1x1 fusion conv, and a 1x1 conv over a concatenation is exactly the sum
+of per-group sub-convs - so zeroing a group's input (what `set_appearance` /
+`set_context` / `set_blur` do) leaves every other group's contribution
+untouched and needs no retraining, the same guarantee v1's additive fusion
+gave. Run ① first.
 
 ```bash
 python src/main.py -m configs/hermiteflow/hermiteflow_r.yaml \
-    --data-path <septuplet> arch.use_rgb_branch=false
+    --data-path <septuplet> arch.use_appearance=false
 ```
 
-`degree=linear` freezes CoeffNet entirely (4.55M trainable vs 8.95M) since a
-straight line has nothing to predict; `quadratic` and `cubic` share identical
-parameters and differ only in Phase 3's basis conversion; `quartic` activates a
-third head. Benchmarks: SNU-FILM hard/extreme, X-TEST, X4K1000FPS at 8× and
-16×. Vimeo triplets show nothing — near-linear motion, and no amortization gain
-at 2×.
+`degree=linear` freezes Phase 2 (`coeff_net`) entirely since a straight line
+has nothing to predict; `quadratic` and `cubic` share identical parameters and
+differ only in Phase 3's basis conversion; `quartic` activates a third head.
+See `Learned_Hermite_VFI_v2.md` for v2.1's parameter budget (~0.43M for Phase
+2 - AppNet + CoeffHead reading RAFT's own features at 1/8 resolution, no
+U-Net) and the ablation table's exact "full / no-appearance /
+flow-only-strict / no-blur" gates. Benchmarks: SNU-FILM hard/extreme, X-TEST,
+X4K1000FPS at 8× and 16×. Vimeo triplets show nothing — near-linear motion,
+and no amortization gain at 2×.
 
 ### Memory and precision
 
-At 256×256 crops the model needs ~1.9 GiB per sample, so `batch_size: 4` fits a
-T4 with room to spare. Mixed precision is on by default; Phase 4's scatter and
+At 256×256 crops the pre-v2.1 model needed ~1.9 GiB per sample; not
+remeasured since Phase 2 moved to a much smaller head running at 1/8
+resolution instead of a full-res U-Net, so treat this as stale until
+someone reruns it - start conservative and raise `experiment.batch_size`
+once you've watched the first few steps. Mixed precision is on by
+default; Phase 4's scatter and
 its normalising division are forced to fp32 inside `forward_splat` regardless
 of autocast, which is the one place half precision would bite. Set
 `experiment.amp=False` if a run ever produces non-finite losses.

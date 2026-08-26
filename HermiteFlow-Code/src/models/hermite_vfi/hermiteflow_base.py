@@ -34,6 +34,7 @@ import torch.nn as nn
 from .configs import HermiteFlowConfig
 from .modules.phase1_measure import (
     align_to_source,
+    blur_descriptor,
     brightness_consistency,
     flow_scale,
     forward_backward_error,
@@ -85,10 +86,14 @@ class HermiteFlowBase(nn.Module):
         # checkpoint serves every entry in the degree ablation - only the
         # basis conversion in Phase 3 changes.
         self.coeff_net = CoeffNet(
-            channels=config.coeff_net_channels,
+            appnet_channels=config.appnet_channels,
+            coeff_head_channels=config.coeff_head_channels,
+            coeff_head_blocks=config.coeff_head_blocks,
             gate_init_bias=config.gate_init_bias,
             gate_init_scale=config.gate_init_scale,
-            use_rgb_branch=config.use_rgb_branch,
+            use_appearance=config.use_appearance,
+            use_context=config.use_context,
+            use_blur=config.use_blur,
             num_residuals=max(RESIDUALS_PER_DEGREE.values()),
             residual_bound=config.residual_bound,
         )
@@ -143,6 +148,24 @@ class HermiteFlowBase(nn.Module):
         """
         raise NotImplementedError
 
+    def flow_with_context(self, img_a, img_b, iters=None):
+        """
+        f_{a->b} plus the flow estimator's own internal state that Phase 2
+        (AppNet + CoeffHead) reads directly instead of re-encoding: context
+        features, final recurrent hidden state, and the raw convex-upsample
+        mask logits (RAFT's c_i, h_i^(N), W_i - see Learned_Hermite_VFI_v2.md).
+
+        Only HermiteFlow_R (RAFT) implements this. FlowFormer has no
+        matching internal state, so HermiteFlow_F raises here rather than
+        silently running a v2.1 Phase 2 built for a different backbone.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement flow_with_context; "
+            "Phase 2's AppNet+CoeffHead needs RAFT's internal context, "
+            "hidden state and upsample mask, which this backbone has no "
+            "equivalent of."
+        )
+
     def estimate_flows(self, img0, img1, iters=None):
         """
         Args:
@@ -167,11 +190,19 @@ class HermiteFlowBase(nn.Module):
 
     def measure(self, img0, img1, iters=None):
         """
-        Phase 1. Returns a dict with F, F', U, U', Z, Z' and the motion
-        scale s. Nothing here is differentiable - it is the measurement.
+        Phase 1. Returns a dict with F, F', U, U', Z, Z', the motion scale
+        s, the blur descriptors B0, B1, and - v2.1 - the RAFT internals
+        Phase 2 reads directly (context, final GRU state, upsample mask,
+        per direction). Nothing here is differentiable - it is the
+        measurement.
         """
         with torch.no_grad():
-            flow_fwd, flow_bwd = self.estimate_flows(img0, img1, iters=iters)
+            flow_fwd, context_fwd, hidden_fwd, mask_fwd = self.flow_with_context(
+                img0, img1, iters=iters
+            )
+            flow_bwd, context_bwd, hidden_bwd, mask_bwd = self.flow_with_context(
+                img1, img0, iters=iters
+            )
             flow_fwd = flow_fwd.detach()
             flow_bwd = flow_bwd.detach()
 
@@ -185,13 +216,23 @@ class HermiteFlowBase(nn.Module):
                 "scale": flow_scale(
                     flow_fwd, flow_bwd, min_scale=self.min_flow_scale
                 ),
+                "blur_fwd": blur_descriptor(img0),
+                "blur_bwd": blur_descriptor(img1),
+                "context_fwd": context_fwd.detach(),
+                "context_bwd": context_bwd.detach(),
+                "hidden_fwd": hidden_fwd.detach(),
+                "hidden_bwd": hidden_bwd.detach(),
+                "mask_fwd": mask_fwd.detach(),
+                "mask_bwd": mask_bwd.detach(),
             }
 
     def predict_velocities(self, img0, img1, measured):
         """
-        Phase 2. Returns the velocity residuals on each lattice:
-        ([d0, d1, ...] on lattice 0, [d0', d1', ...] on lattice 1).
-        Runs once per clip - no t involved.
+        Phase 2. Returns the velocity residuals on each lattice
+        ([d0, d1, ...] on lattice 0, [d0', d1', ...] on lattice 1) and the
+        occlusion gate maps (alpha on lattice 0, alpha' on lattice 1) that
+        the cross-lattice velocity-consistency loss needs. Runs once per
+        clip - no t involved.
         """
         return run_both_sides(
             self.coeff_net,
@@ -201,7 +242,14 @@ class HermiteFlowBase(nn.Module):
             measured["flow_bwd"],
             measured["occ_fwd"],
             measured["occ_bwd"],
-            measured["scale"],
+            measured["blur_fwd"],
+            measured["blur_bwd"],
+            measured["context_fwd"],
+            measured["context_bwd"],
+            measured["hidden_fwd"],
+            measured["hidden_bwd"],
+            measured["mask_fwd"],
+            measured["mask_bwd"],
             align=align_to_source,
         )
 
@@ -309,9 +357,13 @@ class HermiteFlowBase(nn.Module):
         # ---------------- Phase 2: endpoint velocities ----------------
         if self.degree == "linear":
             zeros = torch.zeros_like(flow_fwd)
+            ones = torch.ones_like(measured["occ_fwd"])
             residuals_0 = residuals_1 = [zeros, zeros]
+            alpha_fwd = alpha_bwd = ones
         else:
-            residuals_0, residuals_1 = self.predict_velocities(img0, img1, measured)
+            residuals_0, residuals_1, alpha_fwd, alpha_bwd = self.predict_velocities(
+                img0, img1, measured
+            )
 
         # ---------------- Phase 2.4: basis conversion ----------------
         coeff_a, coeff_b, coeff_c = coefficients_from_residuals(
@@ -327,6 +379,13 @@ class HermiteFlowBase(nn.Module):
         synth_img0, synth_img1 = img0, img1
         if full_size_img is not None:
             synth_img0, synth_img1 = full_size_img[:, :, 0], full_size_img[:, :, 1]
+
+        # Cheap, always computed regardless of return_diagnostics: the
+        # cross-lattice velocity-consistency loss (trainer.py) needs these
+        # every training step, in both stages, not just at eval time.
+        vel_0, vel_1 = endpoint_velocities(flow_fwd, residuals_0)
+        vel_0_sw, vel_1_sw = endpoint_velocities(flow_bwd, residuals_1)
+        raft_flow = torch.cat([flow_fwd.unsqueeze(2), flow_bwd.unsqueeze(2)], dim=2)
 
         imgt_preds, flowt0_preds, flowt1_preds, all_others = [], [], [], []
         phis, psis, holes = [], [], []
@@ -356,6 +415,13 @@ class HermiteFlowBase(nn.Module):
                 "flow_scale": scale,
                 "delta_norm_0": residuals_0[0].abs().mean().detach(),
                 "delta_norm_1": residuals_0[1].abs().mean().detach(),
+                "raft_flow": raft_flow,
+                "m0": vel_0,
+                "m1": vel_1,
+                "m0_swapped": vel_0_sw,
+                "m1_swapped": vel_1_sw,
+                "alpha_fwd": alpha_fwd,
+                "alpha_bwd": alpha_bwd,
             }
 
         for cur_t in t:
@@ -415,6 +481,13 @@ class HermiteFlowBase(nn.Module):
             # after a full run.
             "delta_norm_0": residuals_0[0].abs().mean().detach(),
             "delta_norm_1": residuals_0[1].abs().mean().detach(),
+            "raft_flow": raft_flow,
+            "m0": vel_0,
+            "m1": vel_1,
+            "m0_swapped": vel_0_sw,
+            "m1_swapped": vel_1_sw,
+            "alpha_fwd": alpha_fwd,
+            "alpha_bwd": alpha_bwd,
         }
         if return_trajectory or return_diagnostics:
             outputs["phi"] = phis
@@ -425,19 +498,13 @@ class HermiteFlowBase(nn.Module):
         if not return_diagnostics:
             return outputs
 
-        vel_0, vel_1 = endpoint_velocities(flow_fwd, residuals_0)
         outputs.update({
             "flowt0_pred": flowt0_preds,
             "flowt1_pred": flowt1_preds,
-            "raft_flow": torch.cat(
-                [flow_fwd.unsqueeze(2), flow_bwd.unsqueeze(2)], dim=2
-            ),
             "delta_0": residuals_0[0],
             "delta_1": residuals_0[1],
             "delta_0_swapped": residuals_1[0],
             "delta_1_swapped": residuals_1[1],
-            "m0": vel_0,
-            "m1": vel_1,
             "coeff_a": coeff_a,
             "coeff_b": coeff_b,
             "coeff_a_swapped": coeff_a_sw,

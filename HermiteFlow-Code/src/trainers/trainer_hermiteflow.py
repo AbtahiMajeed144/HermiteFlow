@@ -36,6 +36,7 @@ import torch
 import torchvision
 from tqdm import tqdm
 
+from models.hermite_vfi.modules.fi_utils import warp
 from utils.accumulator import AccmStageINR
 from .trainer import TrainerTemplate
 
@@ -70,6 +71,13 @@ class Trainer(TrainerTemplate):
         self.teacher_raft_iter = int(
             getattr(self.config.loss, "teacher_raft_iter", 12)
         )
+        # v2.1's cross-lattice velocity-consistency regulariser (Training,
+        # item 3). d = 0 satisfies it trivially, so it prunes inconsistent
+        # non-linear solutions between the two passes rather than driving
+        # curvature by itself.
+        self.velocity_consistency_weight = float(
+            getattr(self.config.loss, "velocity_consistency_weight", 0.0)
+        )
         # Write scalars every N optimizer steps. Logging once per epoch is
         # useless here: a Vimeo epoch is ~2k optimizer steps and an X4K
         # one with repeat=8 is ~1.1k, so the first point would land hours
@@ -94,6 +102,7 @@ class Trainer(TrainerTemplate):
                 "l1",
                 "lpips",
                 "distill",
+                "vel_consistency",
                 "delta_0",
                 "delta_1",
                 "psnr",
@@ -196,6 +205,32 @@ class Trainer(TrainerTemplate):
         return loss / (2 * len(teacher))
 
     @staticmethod
+    def velocity_consistency_loss(outputs):
+        """
+        v2.1 Training, item 3: cross-lattice velocity consistency.
+
+        The particle leaving x arrives at x + F(x) on lattice 1, so the
+        two independently-predicted velocity fields must agree there:
+
+            m1(x) = -backwarp(m0', F)(x),   m0(x) = -backwarp(m1', F')(x)
+
+        A regulariser, not a driver - d = 0 satisfies it trivially, so it
+        prunes inconsistent non-linear solutions between the forward and
+        swapped passes rather than creating curvature by itself. Weighted
+        by (1 - alpha_occ), exactly as specified: heaviest where the
+        occlusion gate has already decided the flow is unreliable.
+        """
+        flow_fwd = outputs["raft_flow"][:, :, 0]
+        flow_bwd = outputs["raft_flow"][:, :, 1]
+        term0 = (1.0 - outputs["alpha_fwd"]) * (
+            outputs["m1"] + warp(outputs["m0_swapped"], flow_fwd)
+        )
+        term1 = (1.0 - outputs["alpha_bwd"]) * (
+            outputs["m0"] + warp(outputs["m1_swapped"], flow_bwd)
+        )
+        return 0.5 * (term0.abs().mean() + term1.abs().mean())
+
+    @staticmethod
     def _flow_psnr(preds, targets, scale):
         """PSNR of a predicted trajectory against the teacher, on the
         scale-normalised flow so it is comparable across clips."""
@@ -215,8 +250,15 @@ class Trainer(TrainerTemplate):
         if self.stage == 1:
             zero = torch.zeros((), device=outputs["flow_scale"].device)
             distill = self.trajectory_loss(outputs, teacher)
+            total = distill
             parts = {k: zero for k in ("lap", "census", "l1", "lpips")}
             parts["distill"] = distill
+            if self.velocity_consistency_weight > 0:
+                vel_consistency = self.velocity_consistency_loss(outputs)
+                total = total + self.velocity_consistency_weight * vel_consistency
+                parts["vel_consistency"] = vel_consistency
+            else:
+                parts["vel_consistency"] = zero
             parts["delta_0"] = outputs["delta_norm_0"].mean()
             parts["delta_1"] = outputs["delta_norm_1"].mean()
             # Flow PSNR, the stage-1 analogue of image PSNR: how well
@@ -234,7 +276,7 @@ class Trainer(TrainerTemplate):
                 parts["psnr_lin"] = self._flow_psnr(
                     outputs["phi_linear"], targets, scale
                 )
-            return distill, parts, psnr
+            return total, parts, psnr
 
         num_targets = len(gts)
         parts = {"lap": 0.0, "census": 0.0, "l1": 0.0, "lpips": 0.0}
@@ -266,6 +308,13 @@ class Trainer(TrainerTemplate):
             parts["distill"] = distill
         else:
             parts["distill"] = torch.zeros((), device=total.device)
+
+        if self.velocity_consistency_weight > 0:
+            vel_consistency = self.velocity_consistency_loss(outputs)
+            total = total + self.velocity_consistency_weight * vel_consistency
+            parts["vel_consistency"] = vel_consistency
+        else:
+            parts["vel_consistency"] = torch.zeros((), device=total.device)
 
         parts["psnr_lin"] = torch.zeros((), device=total.device)
         # Not losses - the collapse diagnostic.
@@ -329,6 +378,7 @@ class Trainer(TrainerTemplate):
                     l1=parts["l1"] * count,
                     lpips=parts["lpips"] * count,
                     distill=parts["distill"] * count,
+                    vel_consistency=parts["vel_consistency"] * count,
                     delta_0=parts["delta_0"] * count,
                     delta_1=parts["delta_1"] * count,
                     psnr=psnr_sum,
@@ -474,7 +524,7 @@ class Trainer(TrainerTemplate):
                     def scalar(v):
                         return float(v.detach() if torch.is_tensor(v) else v)
 
-                    for key in ("lap", "census", "l1", "lpips", "distill"):
+                    for key in ("lap", "census", "l1", "lpips", "distill", "vel_consistency"):
                         self.writer.add_scalar(
                             f"step/{key}", scalar(parts[key]), "train", opt_step
                         )
@@ -521,6 +571,7 @@ class Trainer(TrainerTemplate):
                     if torch.is_tensor(parts["lpips"])
                     else parts["lpips"],
                     distill=parts["distill"].detach(),
+                    vel_consistency=parts["vel_consistency"].detach(),
                     delta_0=parts["delta_0"].detach(),
                     delta_1=parts["delta_1"].detach(),
                     psnr=psnr,
@@ -569,7 +620,7 @@ class Trainer(TrainerTemplate):
         if epoch % 10 == 1 or epoch % self.config.experiment.test_imlog_freq == 0:
             self.reconstruct(summary, epoch=epoch, mode=mode)
 
-        for key in ("lap", "census", "l1", "psnr", "lpips", "distill"):
+        for key in ("lap", "census", "l1", "psnr", "lpips", "distill", "vel_consistency"):
             self.writer.add_scalar(f"loss/{key}", summary[key], mode, epoch)
         if self.stage == 1:
             self.writer.add_scalar("loss/psnr_lin", summary["psnr_lin"], mode, epoch)
