@@ -9,11 +9,23 @@
 # --------------------------------------------------------
 
 import collections
-import cupy
 import os
 import re
 import torch
 import typing
+
+# Deferred: gimm.py/gimmvfi_r.py/gimmvfi_f.py import `softsplat` from this
+# module at their own top level, which upstream leaves fine because their
+# environment always has cupy - this project's does not always (e.g. no
+# cupy on this machine at all), and an unconditional `import cupy` here
+# would make importing the whole models package fail before anyone even
+# tries to build a model, let alone run one. Failing at the actual
+# softsplat() call instead - not at import time - matches how this
+# project's own phase4_reverse.py already treats cupy as optional.
+try:
+    import cupy
+except ImportError:
+    cupy = None
 
 
 ##########################################################
@@ -266,13 +278,15 @@ def cuda_launch(strKey: str):
         os.environ["CUDA_HOME"] = cupy.cuda.get_cuda_path()
     # end
 
-    # cupy.cuda.compile_with_cache was removed in newer cupy releases;
-    # cupy.RawModule is the current equivalent (same kernel cache, same
-    # include flags, same .get_function(name) call). Surfaced by adding
-    # cupy to this environment for the GIMM-VFI baseline work - this
-    # splat_impl="cupy" path was previously silently skipped by
-    # test_splat_backends whenever cupy was absent, so nothing had hit
-    # this deprecated call in this project before.
+    # cupy.cuda.compile_with_cache was removed in newer cupy releases
+    # (upstream's softsplat.py targets an old cupy API this project's
+    # installed version does not have) - cupy.RawModule is the current
+    # equivalent, same compiled-kernel-cache behaviour, same include
+    # flags, same .get_function(name) call. Not fully exercised end to
+    # end on this dev machine (no CUDA toolkit headers here to actually
+    # compile against - only the runtime PyTorch needs), so re-check
+    # this path on the real GPU box (which has full CUDA installed)
+    # before a long run.
     return cupy.RawModule(
         code=objCudacache[strKey]["strKernel"],
         options=(
@@ -289,6 +303,13 @@ def cuda_launch(strKey: str):
 
 
 def softsplat(tenIn, tenFlow, tenMetric, strMode, return_norm=False):
+    if cupy is None:
+        raise ImportError(
+            "softsplat() needs cupy (this GIMM-VFI splatting kernel has no "
+            "torch-only fallback, unlike this project's own forward_splat) "
+            "- install a cupy-cudaXXX build matching the CUDA version on "
+            "this machine, e.g. `pip install cupy-cuda12x`."
+        )
     assert strMode.split("-")[0] in ["sum", "avg", "linear", "softmax"]
 
     if strMode == "sum":

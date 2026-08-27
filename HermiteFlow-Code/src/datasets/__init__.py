@@ -16,6 +16,7 @@ from .septuplet_multi_t import VimeoSeptupletMultiT
 from .vimeo_arb import Vimeo_Arbitrary
 from .x4k_cached import X4KCachedGT
 from .x4k_multi_t import X4KMultiT
+from .x4k_single_t import X4KGimmFlowCache, X4KSingleT
 
 from utils.env import env_flag
 
@@ -71,6 +72,46 @@ def create_dataset(config, is_eval=False, logger=None):
         )
         val_path = config.dataset.get("val_path", None) or config.dataset.path
         dataset_val = X4KMultiT("test", val_path, aug=False, **common)
+    elif config.dataset.type == "x4k_single_t":
+        # GIMM stage 2 (gimmvfi_r/_f) baseline: one (I0, I1, GT) triple and
+        # one scalar t per item, drawn from the SAME clip/frame-gap/
+        # downsample/crop/augmentation pipeline HermiteFlow's own X4K
+        # training uses - see x4k_single_t.py.
+        common = dict(
+            num_timesteps=config.dataset.get("num_timesteps", 5),
+            crop_size=config.dataset.get("crop_size", 256),
+            frame_gap=config.dataset.get("frame_gap", 32),
+            num_divisions=config.dataset.get("num_divisions", 8),
+            clip_length=config.dataset.get("clip_length", 65),
+            source=config.dataset.get("source", "auto"),
+            downsample=config.dataset.get("downsample", 1.0),
+        )
+        repeat = config.dataset.get("repeat", 1)
+        dataset_trn = X4KSingleT(
+            "train", config.dataset.path, aug=config.dataset.aug,
+            repeat=repeat, **common
+        )
+        val_path = config.dataset.get("val_path", None) or config.dataset.path
+        dataset_val = X4KSingleT("test", val_path, aug=False, **common)
+    elif config.dataset.type == "x4k_gimm_flow_cache":
+        # GIMM stage 1 (gimm) baseline: reads what
+        # scripts/generate_gimm_flow_cache.py wrote. trainer_gimm.py's
+        # eval() needs the same {"xs","flow_scaler","ori_flows"} shape as
+        # train(), so both splits are cached - point val_cache_path at a
+        # separate (smaller) cache generated from the val data.
+        expect = {
+            "num_divisions": config.dataset.get("num_divisions", 8),
+            "frame_gap": config.dataset.get("frame_gap", 32),
+            "downsample": config.dataset.get("downsample", 1.0),
+        }
+        dataset_trn = X4KGimmFlowCache(
+            config.dataset.cache_path,
+            aug=config.dataset.aug,
+            repeat=config.dataset.get("repeat", 1),
+            expect=expect,
+        )
+        val_cache_path = config.dataset.get("val_cache_path", None) or config.dataset.cache_path
+        dataset_val = X4KGimmFlowCache(val_cache_path, aug=False, expect=expect)
     elif config.dataset.type == "vimeo_septuplet_multi_t":
         # HermiteFlow's default: K ground-truth middle frames per clip, so
         # the curve fitted once in Phase 2 is supervised at several t.

@@ -1,0 +1,101 @@
+# GIMM baseline, stage 1 (motion only) — trained from scratch on X4K1000FPS.
+#
+# Same protocol HermiteFlow's own hermiteflow_r_x4k_stage1.yaml trains
+# on: same clips, same frame_gap/num_divisions/downsample/crop_size,
+# same train/val split. arch/optimizer below are GIMM's own
+# hyperparameters, copied from GIMM-VFI/configs/gimm/gimm.yaml
+# unmodified - not second-guessed for a baseline.
+#
+# Needs a flow cache first (trainer_gimm.py has no online-RAFT path -
+# see scripts/generate_gimm_flow_cache.py and src/datasets/x4k_single_t.py
+# for why):
+#
+#   python scripts/generate_gimm_flow_cache.py \
+#       -m configs/hermiteflow/hermiteflow_r_x4k_stage1.yaml \
+#       --output-dir /kaggle/working/gimm_flow_cache_train \
+#       --data-path /kaggle/input/.../x4k1000fps/encoded_train \
+#       --raft-ckpt /kaggle/input/.../raft-things.pth
+#   python scripts/generate_gimm_flow_cache.py \
+#       -m configs/hermiteflow/hermiteflow_r_x4k_stage1.yaml \
+#       --output-dir /kaggle/working/gimm_flow_cache_val \
+#       --data-path /kaggle/input/.../x4k1000fps/val \
+#       --raft-ckpt /kaggle/input/.../raft-things.pth
+#
+# Then:
+#   python src/main.py -m configs/gimm/gimm_x4k.yaml \
+#       --result-path /kaggle/working/runs_gimm \
+#       dataset.cache_path=/kaggle/working/gimm_flow_cache_train \
+#       dataset.val_cache_path=/kaggle/working/gimm_flow_cache_val
+
+trainer: stage_inr
+
+dataset:
+  type: x4k_gimm_flow_cache
+  cache_path: null
+  val_cache_path: null
+  # Only read by the cache-generation script above, not by training
+  # itself - kept here so the protocol (frame_gap etc.) is documented
+  # alongside the run that consumes it and the cache's manifest.json
+  # can be checked against these values.
+  path: ./data/x4k/encoded_train
+  val_path: ./data/x4k/val
+  source: auto
+  frame_gap: 32
+  num_divisions: 8
+  clip_length: 65
+  crop_size: 256
+  downsample: 3.0
+  aug: true
+  repeat: 8
+
+arch:
+  type: gimm
+  ema: null
+  fwarp_type: linear
+  coord_range: [-1., 1.]
+  modulated_layer_idxs: [1]
+  hyponet:
+    type: mlp
+    n_layer: 5 # including the output layer
+    hidden_dim: [128]
+    use_bias: true
+    input_dim: 3
+    output_dim: 2
+    output_bias: 0.5
+    activation:
+      type: siren
+      siren_w0: 1.0
+    initialization:
+      weight_init_type: siren
+      bias_init_type: siren
+
+loss:
+  type: mse
+
+optimizer:
+  type: adam
+  init_lr: 0.0001
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  ft: false
+  warmup:
+    epoch: 0
+    multiplier: 1
+    buffer_epoch: 0
+    min_lr: 0.0001
+    mode: fix
+    start_from_zero: True
+  max_gn: null
+
+experiment:
+  amp: True
+  batch_size: 32
+  total_batch_size: 64
+  # Upstream's own recipe trains this for 400 epochs on Vimeo triplets
+  # (far fewer clips per epoch than X4K with repeat=8) - unverified
+  # whether that many are needed here. Kaggle sessions are capped;
+  # checkpoint every epoch and chain sessions with --resume --load-path.
+  epochs: 400
+  save_ckpt_freq: 1
+  test_freq: 10
+  test_imlog_freq: 10

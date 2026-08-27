@@ -1,0 +1,96 @@
+# GIMM baseline, stage 2 (joint) — trained from scratch on X4K1000FPS.
+#
+# Same protocol HermiteFlow's own hermiteflow_r_x4k.yaml trains on: same
+# clips, same frame_gap/num_divisions/downsample/crop_size, same
+# train/val split. arch/optimizer below are GIMM's own hyperparameters,
+# copied from GIMM-VFI/configs/gimmvfi/gimmvfi_r_arb.yaml unmodified -
+# not second-guessed for a baseline.
+#
+# Initialise from the stage-1 (gimm_x4k.yaml) checkpoint:
+#   ... -m configs/gimmvfi/gimmvfi_r_x4k.yaml --load-path <stage1-run>/epochN_model.pt
+#
+# No offline cache needed here (unlike stage 1) - X4KSingleT draws
+# frames on the fly, same as HermiteFlow's own x4k_multi_t.
+#
+#   python src/main.py -m configs/gimmvfi/gimmvfi_r_x4k.yaml \
+#       --result-path /kaggle/working/runs_gimmvfi_r \
+#       --data-path /kaggle/input/.../x4k1000fps/encoded_train \
+#       --val-path  /kaggle/input/.../x4k1000fps/val \
+#       --raft-ckpt /kaggle/input/.../raft-things.pth
+
+trainer: stage_inr
+
+dataset:
+  type: x4k_single_t
+  path: ./data/x4k/encoded_train
+  val_path: ./data/x4k/val
+  source: auto
+  frame_gap: 32
+  num_divisions: 8
+  clip_length: 65
+  crop_size: 256
+  downsample: 3.0
+  aug: true
+  # Only affects how many distinct k are available to draw ONE random
+  # t from per item (X4KSingleT collapses X4KMultiT's K middles to 1) -
+  # kept at the same K HermiteFlow's own stage-2 config uses so a given
+  # clip+window offers the same pool of supervised timesteps either way.
+  num_timesteps: 5
+  repeat: 8
+
+arch:
+  type: gimmvfi_r
+  ema: true
+  fwarp_type: linear
+  rec_weight: 0.1
+  raft_iter: 20
+  pretrained_raft_ckpt: pretrained/raft-things.pth
+  coord_range: [-1., 1.]
+  modulated_layer_idxs: [1]
+  hyponet:
+    type: mlp
+    n_layer: 5
+    hidden_dim: [128]
+    use_bias: true
+    input_dim: 3
+    output_dim: 2
+    output_bias: 0.5
+    activation:
+      type: siren
+      siren_w0: 1.0
+    initialization:
+      weight_init_type: siren
+      bias_init_type: siren
+
+loss:
+  perceptual_loss: True
+  subsample:
+    type: random
+    ratio: 0.1
+
+optimizer:
+  type: adamw
+  init_lr: 0.00008
+  weight_decay: 0.00004
+  betas: [0.9, 0.999]
+  # GIMM-VFI's own stage-2 grouping: the fresh synthesis parts train at
+  # init_lr, the pretrained motion module (loaded via --load-path) fine-
+  # tunes gently. Same idea HermiteFlow's own stage 2 uses.
+  ft: true
+  warmup:
+    epoch: 1
+    multiplier: 1
+    buffer_epoch: 0
+    min_lr: 0.000008
+    mode: fix
+    start_from_zero: True
+  max_gn: null
+
+experiment:
+  amp: True
+  batch_size: 4
+  total_batch_size: 32
+  epochs: 60
+  save_ckpt_freq: 1
+  test_freq: 10
+  test_imlog_freq: 10

@@ -8,6 +8,7 @@ from easydict import EasyDict as edict
 import yaml
 
 from models.hermite_vfi.configs import HermiteFlowConfig
+from models.generalizable_INR.configs import GIMMConfig, GIMMVFIConfig
 import os.path as osp
 
 
@@ -29,6 +30,10 @@ def load_config(config_path):
 def augment_arch_defaults(arch_config):
     if arch_config.type in ["hermiteflow_r", "hermiteflow_f"]:
         arch_defaults = HermiteFlowConfig.create(arch_config)
+    elif arch_config.type == "gimm":
+        arch_defaults = GIMMConfig.create(arch_config)
+    elif arch_config.type in ["gimmvfi", "gimmvfi_f", "gimmvfi_r"]:
+        arch_defaults = GIMMVFIConfig.create(arch_config)
     else:
         raise ValueError(f"{arch_config.type} is not implemented for default arguments")
 

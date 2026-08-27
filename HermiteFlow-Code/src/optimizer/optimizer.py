@@ -72,8 +72,57 @@ def create_hermiteflow_optimizer(model, config):
     raise ValueError(f"{optimizer_type} invalid..")
 
 
+def create_inr_optimizer(model, config):
+    """
+    GIMM-VFI's own optimizer grouping, vendored verbatim from its
+    optimizer.py: `optimizer.ft: true` splits on the "amt_" prefix
+    (their synthesis decoder's own naming) instead of this project's
+    PRETRAINED_PREFIXES, since that is what their state_dict actually
+    uses - HermiteFlow's split and GIMM's split are the same IDEA
+    (fresh module at full LR, pretrained motion module fine-tuned
+    gently) applied to two differently-named module trees.
+    """
+    optimizer_type = config.type.lower()
+    if not config.ft:
+        param_dicts = model.parameters()
+    else:
+        param_dicts = [
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if "amt_" in n and p.requires_grad
+                ]
+            },
+            {
+                "params": [
+                    p for n, p in model.named_parameters()
+                    if "amt_" not in n and p.requires_grad
+                ],
+                "lr": config.init_lr * 0.01,
+                "weight_decay": config.weight_decay * 0.01,
+            },
+        ]
+        if len(param_dicts[1]["params"]) == 0:
+            print("only amt_part will be trained")
+
+    kwargs = dict(lr=config.init_lr, weight_decay=config.weight_decay)
+    if optimizer_type in ("adamw", "adam"):
+        kwargs["betas"] = tuple(config.betas)
+
+    if optimizer_type == "adamw":
+        return torch.optim.AdamW(param_dicts, **kwargs)
+    if optimizer_type == "adam":
+        return torch.optim.Adam(param_dicts, **kwargs)
+    if optimizer_type == "sgd":
+        return torch.optim.SGD(param_dicts, momentum=0.9, **kwargs)
+
+    raise ValueError(f"{optimizer_type} invalid..")
+
+
 def create_optimizer(model, config):
     arch_type = config.arch.type.lower()
     if "hermite" in arch_type:
         return create_hermiteflow_optimizer(model, config.optimizer)
+    if "inr" in arch_type or "dnn" in arch_type or "gimm" in arch_type:
+        return create_inr_optimizer(model, config.optimizer)
     raise ValueError(f"{arch_type} invalid..")
