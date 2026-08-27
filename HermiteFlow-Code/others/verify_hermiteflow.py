@@ -1023,13 +1023,18 @@ def test_velocity_consistency_loss():
         # Same formula as Trainer.velocity_consistency_loss, reimplemented
         # here so this file does not have to import the trainer (and its
         # heavier deps - LPIPS, tqdm, torchvision) just to check the math.
+        # Divided by flow_scale for the same reason trajectory_loss is -
+        # a real run showed this term at ~0.56px (raw) against distill's
+        # ~0.018 (scale-normalised), so at weight 0.1 it supplied ~76% of
+        # the total loss and drove flow-PSNR gain over linear negative.
+        scale = outputs["flow_scale"]
         flow_fwd = outputs["raft_flow"][:, :, 0]
         flow_bwd = outputs["raft_flow"][:, :, 1]
         term0 = (1.0 - outputs["alpha_fwd"]) * (
-            outputs["m1"] + warp(outputs["m0_swapped"], flow_fwd)
+            (outputs["m1"] + warp(outputs["m0_swapped"], flow_fwd)) / scale
         )
         term1 = (1.0 - outputs["alpha_bwd"]) * (
-            outputs["m0"] + warp(outputs["m1_swapped"], flow_bwd)
+            (outputs["m0"] + warp(outputs["m1_swapped"], flow_bwd)) / scale
         )
         return 0.5 * (term0.abs().mean() + term1.abs().mean())
 
@@ -1051,6 +1056,7 @@ def test_velocity_consistency_loss():
         m0_swapped=m0_swapped, m1_swapped=m1_swapped,
         alpha_fwd=torch.ones(batch, 1, h, w),
         alpha_bwd=torch.ones(batch, 1, h, w),
+        flow_scale=torch.ones(batch, 1, 1, 1),  # inert - isolates the other checks
     )
     loss_consistent = vel_consistency_loss(consistent)
     check("exactly-consistent lattices give zero loss",
@@ -1074,6 +1080,22 @@ def test_velocity_consistency_loss():
     loss_trusted = vel_consistency_loss(inconsistent)
     check("(1 - alpha_occ) weighting: alpha=1 mutes a disagreement, not amplifies it",
           loss_trusted.item() < 1e-6, f"loss = {loss_trusted.item():.2e}")
+
+    # Scale normalisation: the same raw disagreement at 4x the motion
+    # scale must give 1/4 the loss - this is the fix for the real run
+    # where the unnormalised term (raw pixels) drowned out the already
+    # scale-normalised distill term.
+    base_case = dict(inconsistent)
+    base_case["alpha_fwd"] = torch.zeros(batch, 1, h, w)
+    base_case["alpha_bwd"] = torch.zeros(batch, 1, h, w)
+    loss_scale1 = vel_consistency_loss(base_case)
+    scaled_case = dict(base_case)
+    scaled_case["flow_scale"] = torch.full((batch, 1, 1, 1), 4.0)
+    loss_scale4 = vel_consistency_loss(scaled_case)
+    check("loss scales as 1/flow_scale",
+          abs(loss_scale4.item() - loss_scale1.item() / 4.0) < 1e-4,
+          f"loss(s=1)={loss_scale1.item():.4f}, loss(s=4)={loss_scale4.item():.4f}, "
+          f"expected {loss_scale1.item()/4.0:.4f}")
 
     # Gradient reaches both m1 and the warped m0_swapped path.
     grad_case = {

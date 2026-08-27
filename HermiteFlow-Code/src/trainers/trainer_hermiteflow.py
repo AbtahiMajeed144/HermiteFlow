@@ -219,14 +219,26 @@ class Trainer(TrainerTemplate):
         swapped passes rather than creating curvature by itself. Weighted
         by (1 - alpha_occ), exactly as specified: heaviest where the
         occlusion gate has already decided the flow is unreliable.
+
+        Divided by the per-sample motion scale s, for exactly the reason
+        trajectory_loss is: m0/m1 are raw pixels, and without normalising
+        this term's magnitude swings with how much the clip moves while
+        `loss.velocity_consistency_weight` stays fixed. Measured without
+        this on a real run: vel_consistency ~0.56 px against distill's
+        ~0.018 (already scale-normalised), so at the documented weight of
+        0.1 this unnormalised term supplied ~76% of the total loss instead
+        of acting as a minor regulariser - and flow-PSNR gain over the
+        linear baseline went NEGATIVE (the model was being pulled towards
+        cross-lattice agreement at the expense of matching the teacher).
         """
+        scale = outputs["flow_scale"]
         flow_fwd = outputs["raft_flow"][:, :, 0]
         flow_bwd = outputs["raft_flow"][:, :, 1]
         term0 = (1.0 - outputs["alpha_fwd"]) * (
-            outputs["m1"] + warp(outputs["m0_swapped"], flow_fwd)
+            (outputs["m1"] + warp(outputs["m0_swapped"], flow_fwd)) / scale
         )
         term1 = (1.0 - outputs["alpha_bwd"]) * (
-            outputs["m0"] + warp(outputs["m1_swapped"], flow_bwd)
+            (outputs["m0"] + warp(outputs["m1_swapped"], flow_bwd)) / scale
         )
         return 0.5 * (term0.abs().mean() + term1.abs().mean())
 

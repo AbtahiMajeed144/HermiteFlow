@@ -488,13 +488,16 @@ class HermiteFlowBase(nn.Module):
             "m1_swapped": vel_1_sw,
             "alpha_fwd": alpha_fwd,
             "alpha_bwd": alpha_bwd,
+            # Four floats per sample. Both the trajectory loss and the
+            # velocity-consistency loss divide by this so their magnitude
+            # does not depend on how much the scene moves - always
+            # available, not gated behind return_trajectory/diagnostics,
+            # since the fast training path needs it every step too.
+            "flow_scale": scale,
         }
         if return_trajectory or return_diagnostics:
             outputs["phi"] = phis
             outputs["psi"] = psis
-            # Four floats per sample. The trajectory loss divides by this
-            # so its magnitude does not depend on how much the scene moves.
-            outputs["flow_scale"] = scale
         if not return_diagnostics:
             return outputs
 
