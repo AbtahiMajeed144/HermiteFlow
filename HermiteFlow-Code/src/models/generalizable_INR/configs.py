@@ -9,7 +9,7 @@
 # --------------------------------------------------------
 
 from typing import List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from omegaconf import OmegaConf, MISSING
 from .modules.module_config import HypoNetConfig
@@ -21,7 +21,10 @@ class GIMMConfig:
     ema: Optional[bool] = None
     ema_value: Optional[float] = None
     fwarp_type: str = "linear"
-    hyponet: HypoNetConfig = HypoNetConfig()
+    # See module_config.py's HypoNetConfig for why this must be
+    # default_factory, not a bare mutable default - upstream's own
+    # `= HypoNetConfig()` breaks on Python 3.11+ (Kaggle's 3.12).
+    hyponet: HypoNetConfig = field(default_factory=HypoNetConfig)
     coord_range: List[float] = MISSING
     modulated_layer_idxs: Optional[List[int]] = None
 
@@ -42,7 +45,7 @@ class GIMMVFIConfig:
     ema_value: Optional[float] = None
     fwarp_type: str = "linear"
     rec_weight: float = 0.1
-    hyponet: HypoNetConfig = HypoNetConfig()
+    hyponet: HypoNetConfig = field(default_factory=HypoNetConfig)
     raft_iter: int = 20
     coord_range: List[float] = MISSING
     modulated_layer_idxs: Optional[List[int]] = None

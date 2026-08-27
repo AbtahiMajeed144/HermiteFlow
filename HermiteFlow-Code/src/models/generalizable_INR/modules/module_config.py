@@ -9,7 +9,7 @@
 # --------------------------------------------------------
 
 from typing import List, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from omegaconf import MISSING
 
 
@@ -34,8 +34,15 @@ class HypoNetConfig:
     input_dim: int = 2
     output_dim: int = 3
     output_bias: float = 0.5
-    activation: HypoNetActivationConfig = HypoNetActivationConfig()
-    initialization: HypoNetInitConfig = HypoNetInitConfig()
+    # Upstream wrote these as bare `= HypoNetActivationConfig()` /
+    # `= HypoNetInitConfig()` mutable defaults - dataclasses has always
+    # disallowed that for list/dict/set, and newer Python (3.11+,
+    # including Kaggle's 3.12) extended the check to any type without
+    # __hash__, which a plain @dataclass is unless frozen. Python 3.10
+    # (this dev machine) does not enforce it, which is why this only
+    # broke on Kaggle. default_factory is the fix either version wants.
+    activation: HypoNetActivationConfig = field(default_factory=HypoNetActivationConfig)
+    initialization: HypoNetInitConfig = field(default_factory=HypoNetInitConfig)
 
     normalize_weight: bool = True
     linear_interpo: bool = False
