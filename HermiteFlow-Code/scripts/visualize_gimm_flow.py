@@ -164,9 +164,16 @@ def main():
         idxs = [int(round(i * (n - 1) / max(1, k - 1))) for i in range(k)] if k > 1 else [0]
     print(f"{n} clips available; rendering {len(idxs)}: {idxs}")
 
+    results = []  # (fig_i, idx, cols) for every sample that rendered
     for fig_i, idx in enumerate(idxs):
-        _process(args, model, raft, raft_iter, dataset, num_div, timesteps, fig_i, idx, device)
+        cols = _process(args, model, raft, raft_iter, dataset, num_div, timesteps, idx, device)
+        if cols is None:
+            continue
+        _render(args, fig_i, idx, cols)        # per-sample figure
+        results.append((fig_i, idx, cols))
 
+    if results:
+        _render_combined(args, results)        # one image of all samples
     print(f"done -> {args.output_dir}")
 
 
@@ -189,7 +196,9 @@ def _resolve_frame(t, num_div, times, middles, img0, img1):
     return None, None
 
 
-def _process(args, model, raft, raft_iter, dataset, num_div, timesteps, fig_i, idx, device):
+def _process(args, model, raft, raft_iter, dataset, num_div, timesteps, idx, device):
+    """Run one clip through the model and build its per-timestep column data.
+    Returns the list of column dicts, or None if the clip could not be used."""
     sample = dataset[idx]
     xs = sample["xs"].unsqueeze(0).to(device)   # (1, 3, 2 + K, H, W)
     times = [float(v) for v in sample["t"].tolist()]
@@ -201,7 +210,7 @@ def _process(args, model, raft, raft_iter, dataset, num_div, timesteps, fig_i, i
     Fp = raft_flow(raft, img1, img0, raft_iter)
     if not (torch.isfinite(F).all() and torch.isfinite(Fp).all()):
         print(f"  clip {idx}: non-finite endpoint flow, skipped")
-        return
+        return None
 
     scaler = torch.stack([F.abs(), Fp.abs()]).max().clamp_min(1.0)
     F_n, Fp_n = (F / scaler + 1) / 2, (Fp / scaler + 1) / 2
@@ -249,7 +258,7 @@ def _process(args, model, raft, raft_iter, dataset, num_div, timesteps, fig_i, i
         for c in cols:
             c["mx"] = shared
 
-    _render(args, fig_i, idx, cols)
+    return cols
 
 
 def _render(args, fig_i, idx, cols):
@@ -279,7 +288,7 @@ def _render(args, fig_i, idx, cols):
         ax.imshow(flow_to_image(to_uv(col["pred"]), max_flow=mx))
         _strip(ax)
         if c == 0:
-            ax.set_ylabel("GIMM (pred)", fontsize=11)
+            ax.set_ylabel("Predicted", fontsize=11)
 
         # Row 2: RAFT ground-truth flow at t.
         ax = axes[2][c]
@@ -295,7 +304,7 @@ def _render(args, fig_i, idx, cols):
     fig.suptitle(f"X4K clip #{idx} — GIMM flow generation vs RAFT ground truth", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
-    stem = os.path.join(args.output_dir, f"gimm_flow_sample{fig_i:02d}_clip{idx:04d}")
+    stem = os.path.join(args.output_dir, f"final_gimm_flow_sample{fig_i:02d}_clip{idx:04d}")
     fig.savefig(stem + ".png", dpi=args.dpi, bbox_inches="tight")
     if not args.no_pdf:
         fig.savefig(stem + ".pdf", bbox_inches="tight")  # vector, for LaTeX
@@ -313,6 +322,58 @@ def _render(args, fig_i, idx, cols):
                        flow_to_image(to_uv(col["gt"]), max_flow=col["mx"]))
         if col["real"] is not None:
             plt.imsave(os.path.join(paneldir, tag + "_frame.png"), to_rgb(col["real"]))
+
+
+def _render_combined(args, results):
+    """One image holding every sample: a 3-row (frame / predicted / GT) block
+    per clip, stacked vertically, with the timestep columns shared."""
+    ncol = len(results[0][2])
+    nblock = len(results)
+    nrow = 3 * nblock
+    fig, axes = plt.subplots(nrow, ncol, figsize=(2.4 * ncol, 2.3 * nrow), squeeze=False)
+    row_names = ("Frame $I_t$", "Predicted", "GT (RAFT)")
+
+    for b, (_fig_i, idx, cols) in enumerate(results):
+        for c, col in enumerate(cols):
+            t, mx = col["t"], col["mx"]
+            r0 = 3 * b
+
+            ax = axes[r0][c]                       # frame
+            if col["real"] is not None:
+                ax.imshow(to_rgb(col["real"]))
+                if col["kind"] == "start":
+                    ax.set_xlabel("input: frame 0", fontsize=8)
+                elif col["kind"] == "end":
+                    ax.set_xlabel("input: frame 1", fontsize=8)
+            else:
+                _blank(ax, "off-grid")
+            if b == 0:
+                ax.set_title(f"$t={t:g}$", fontsize=11)
+
+            axes[r0 + 1][c].imshow(flow_to_image(to_uv(col["pred"]), max_flow=mx))  # pred
+
+            ax = axes[r0 + 2][c]                   # GT
+            if col["gt"] is not None:
+                ax.imshow(flow_to_image(to_uv(col["gt"]), max_flow=mx))
+                ax.set_xlabel(f"EPE {col['epe']:.2f}px", fontsize=8)
+            else:
+                _blank(ax, "no GT")
+
+            for rr, name in enumerate(row_names):
+                a = axes[r0 + rr][c]
+                _strip(a)
+                if c == 0:
+                    label = f"clip {idx}\n{name}" if rr == 0 else name
+                    a.set_ylabel(label, fontsize=10)
+
+    fig.suptitle("GIMM flow generation vs RAFT ground truth — X4K samples", fontsize=13)
+    fig.tight_layout(rect=(0, 0, 1, 0.99))
+    stem = os.path.join(args.output_dir, "final_gimm_flow_all")
+    fig.savefig(stem + ".png", dpi=args.dpi, bbox_inches="tight")
+    if not args.no_pdf:
+        fig.savefig(stem + ".pdf", bbox_inches="tight")
+    plt.close(fig)
+    print(f"combined figure: {stem}.png ({nblock} samples)")
 
 
 def _strip(ax):
