@@ -68,10 +68,24 @@ def parse_args():
     p.add_argument("--data-path", type=str, required=True, help="X4K clips (val/train)")
     p.add_argument("--raft-ckpt", type=str, required=True)
     p.add_argument("--output-dir", type=str, required=True)
+    p.add_argument(
+        "--name", type=str, default="final_gimm_flow",
+        help="filename stem for every output; per-sample files become "
+             "<name>_sampleNN_clipXXXX.* and the combined image <name>_all.*",
+    )
     p.add_argument("--num-samples", type=int, default=6)
     p.add_argument(
+        "--clips", type=str, default=None,
+        help="explicit clip indices, e.g. '3,17,42' - pins exactly these clips "
+             "and ignores --num-samples/--sample-stride. Use this to keep the "
+             "same clips across runs regardless of other settings.",
+    )
+    p.add_argument(
         "--sample-stride", type=int, default=None,
-        help="pick every Nth clip; default spaces samples evenly across the split",
+        help="pick every Nth clip; default spaces samples evenly across the "
+             "split. Both this and the default are DETERMINISTIC: same split "
+             "size + args -> same clips every run (frame choice is fixed too, "
+             "test-split centre window, no augmentation).",
     )
     p.add_argument(
         "--timesteps", type=str, default="0,0.25,0.5,0.75,1.0",
@@ -157,7 +171,9 @@ def main():
     if n == 0:
         raise SystemExit(f"no clips found under {args.data_path}")
 
-    if args.sample_stride:
+    if args.clips:
+        idxs = [int(x) % n for x in args.clips.split(",")]   # pinned, exact
+    elif args.sample_stride:
         idxs = list(range(0, n, args.sample_stride))[: args.num_samples]
     else:  # evenly spaced across the split, so the figures are not all clip 0
         k = min(args.num_samples, n)
@@ -304,7 +320,7 @@ def _render(args, fig_i, idx, cols):
     fig.suptitle(f"X4K clip #{idx} — GIMM flow generation vs RAFT ground truth", fontsize=12)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
-    stem = os.path.join(args.output_dir, f"final_gimm_flow_sample{fig_i:02d}_clip{idx:04d}")
+    stem = os.path.join(args.output_dir, f"{args.name}_sample{fig_i:02d}_clip{idx:04d}")
     fig.savefig(stem + ".png", dpi=args.dpi, bbox_inches="tight")
     if not args.no_pdf:
         fig.savefig(stem + ".pdf", bbox_inches="tight")  # vector, for LaTeX
@@ -314,7 +330,7 @@ def _render(args, fig_i, idx, cols):
     paneldir = os.path.join(args.output_dir, "panels")
     os.makedirs(paneldir, exist_ok=True)
     for col in cols:
-        tag = f"s{fig_i:02d}_clip{idx:04d}_t{col['t']:g}"
+        tag = f"{args.name}_s{fig_i:02d}_clip{idx:04d}_t{col['t']:g}"
         plt.imsave(os.path.join(paneldir, tag + "_pred.png"),
                    flow_to_image(to_uv(col["pred"]), max_flow=col["mx"]))
         if col["gt"] is not None:
@@ -368,7 +384,7 @@ def _render_combined(args, results):
 
     fig.suptitle("GIMM flow generation vs RAFT ground truth — X4K samples", fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.99))
-    stem = os.path.join(args.output_dir, "final_gimm_flow_all")
+    stem = os.path.join(args.output_dir, f"{args.name}_all")
     fig.savefig(stem + ".png", dpi=args.dpi, bbox_inches="tight")
     if not args.no_pdf:
         fig.savefig(stem + ".pdf", bbox_inches="tight")
